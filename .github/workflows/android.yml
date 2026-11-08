@@ -25,6 +25,12 @@ jobs:
         with:
           packages: 'platform-tools'
 
+      - name: Build and test portable C++ core
+        run: |
+          cmake -S . -B build -DTGTUNNEL_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel 2
+          ctest --test-dir build --output-on-failure
+
       - name: Install Android SDK, NDK and CMake
         run: |
           yes | sdkmanager --licenses
