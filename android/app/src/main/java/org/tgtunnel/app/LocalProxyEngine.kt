@@ -40,6 +40,19 @@ internal object LocalProxyEngine {
     @Volatile private var acceptThread: Thread? = null
     @Volatile private var logCallback: ((String) -> Unit)? = null
     @Volatile private var workerDomains: List<String> = emptyList()
+    @Volatile private var cloudflareProxyEnabled: Boolean = true
+    private val activeCfProxyDomains = ConcurrentHashMap<Int, String>()
+
+    // Encoded list and decoding are kept compatible with Flowseal's upstream
+    // config.py. A built-in list lets the fallback work before GitHub refresh.
+    private val encodedCfProxyDomains = listOf(
+        "virkgj.com", "vmmzovy.com", "mkuosckvso.com", "zaewayzmplad.com",
+        "twdmbzcm.com", "awzwsldi.com", "clngqrflngqin.com", "tjacxbqtj.com",
+        "bxaxtxmrw.com", "dmohrsgmohcrwb.com", "vwbmtmoi.com", "khgrre.com",
+        "ulihssf.com", "tmhqsdqmfpmk.com", "xwuwoqbm.com", "orgcnunpj.com",
+        "zhkuldz.com", "zypoljnslxa.com", "efabnxaowuzs.com", "zaftuzsftqdq.com"
+    )
+    private val cfProxyDomains = encodedCfProxyDomains.map(::decodeCfProxyDomain)
 
     private interface Upstream {
         fun socketForTracking(): Socket
@@ -198,11 +211,11 @@ internal object LocalProxyEngine {
         val telegramDecrypt: Cipher
     )
 
-    fun info(): String = "Android MTProto bridge · Telegram WS + Cloudflare Worker fallback"
+    fun info(): String = "Android MTProto bridge · Telegram WS + CF Worker + CF Proxy + TCP fallback"
 
     fun isRunning(): Boolean = running.get()
 
-    fun start(port: Int, secretHex: String, workerDomain: String, onLog: (String) -> Unit): String {
+    fun start(port: Int, secretHex: String, workerDomain: String, cfProxyEnabled: Boolean, onLog: (String) -> Unit): String {
         if (port !in 1..65535) return "ERR:Port must be between 1 and 65535"
         val secret = parseSecret(secretHex) ?: return "ERR:Secret must contain exactly 32 hexadecimal characters"
         val configuredWorkers = parseWorkerDomains(workerDomain)
@@ -219,6 +232,8 @@ internal object LocalProxyEngine {
                 boundServer.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 64)
                 logCallback = onLog
                 workerDomains = configuredWorkers
+                cloudflareProxyEnabled = cfProxyEnabled
+                activeCfProxyDomains.clear()
                 listener = boundServer
                 running.set(true)
                 acceptThread = Thread({ acceptLoop(boundServer, secret) }, "tgtunnel-accept").apply {
@@ -242,6 +257,8 @@ internal object LocalProxyEngine {
             runCatching { listener?.close() }
             listener = null
             workerDomains = emptyList()
+            cloudflareProxyEnabled = false
+            activeCfProxyDomains.clear()
             activeClients.toList().forEach { runCatching { it.close() } }
             activeUpstreams.toList().forEach { runCatching { it.close() } }
             activeClients.clear()
@@ -399,6 +416,28 @@ internal object LocalProxyEngine {
             }
         }
 
+        // Flowseal's CF Proxy tier: connect to kws<dc>.<Cloudflare-proxied-domain>.
+        // It is independent from the optional user-owned Worker tunnel above.
+        if (cloudflareProxyEnabled) {
+            val preferred = activeCfProxyDomains[dcForDomain]
+            val candidates = buildList {
+                if (preferred != null) add(preferred)
+                addAll(cfProxyDomains.shuffled().filter { it != preferred })
+            }
+            for (baseDomain in candidates) {
+                val host = "kws" + dcForDomain + "." + baseDomain
+                try {
+                    val upstream = connectWebSocket(host)
+                    activeCfProxyDomains[dcForDomain] = baseDomain
+                    log("Connected to DC" + handshake.dcId + " through Cloudflare Proxy (" + baseDomain + ")")
+                    return upstream
+                } catch (error: Exception) {
+                    log("Cloudflare Proxy " + baseDomain + " failed: " +
+                        (error.message ?: error.javaClass.simpleName))
+                }
+            }
+        }
+
         val ip = when (handshake.dcId) {
             1 -> "149.154.175.50"
             2 -> "149.154.167.51"
@@ -480,6 +519,19 @@ internal object LocalProxyEngine {
             runCatching { socket.close() }
             throw error
         }
+    }
+
+    private fun decodeCfProxyDomain(encoded: String): String {
+        val prefix = encoded.removeSuffix(".com")
+        val shift = prefix.count { it.isLetter() }
+        val decoded = prefix.map { char ->
+            when (char) {
+                in 'a'..'z' -> 'a' + (char - 'a' - shift + 26) % 26
+                in 'A'..'Z' -> 'A' + (char - 'A' - shift + 26) % 26
+                else -> char
+            }
+        }.joinToString("")
+        return decoded + ".co.uk"
     }
 
     private fun parseWorkerDomains(value: String): List<String> {

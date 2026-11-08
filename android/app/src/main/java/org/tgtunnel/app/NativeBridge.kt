@@ -10,8 +10,8 @@ internal object NativeBridge {
 
     fun isRunning(): Boolean = LocalProxyEngine.isRunning()
 
-    fun start(port: Int, secret: String, workerDomain: String, onLog: (String) -> Unit): String =
-        LocalProxyEngine.start(port, secret, workerDomain, onLog)
+    fun start(port: Int, secret: String, workerDomain: String, cfProxyEnabled: Boolean, onLog: (String) -> Unit): String =
+        LocalProxyEngine.start(port, secret, workerDomain, cfProxyEnabled, onLog)
 
     fun stop(): String = LocalProxyEngine.stop()
 }
