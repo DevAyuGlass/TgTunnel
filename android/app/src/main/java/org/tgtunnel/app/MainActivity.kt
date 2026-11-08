@@ -363,10 +363,10 @@ private fun EngineCard() {
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Column(modifier = Modifier.padding(17.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            EngineRow("Платформа", "Android / Linux")
+            EngineRow("Платформа", "Android only")
             EngineRow("Язык движка", "C++")
             EngineRow("Интерфейс", "Kotlin + Compose")
-            EngineRow("Состояние", "JNI подключён · MTProto в работе", AccentPurple)
+            EngineRow("Состояние", "MTProto transport не реализован", ErrorRed)
         }
     }
 }
@@ -464,7 +464,7 @@ private fun SettingsScreen(
                 Text("NATIVE CORE", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 Text(engineInfo, color = TextPrimary, fontSize = 13.sp)
                 Text(
-                    "JNI уже связан с приложением. Сам транспорт MTProto ещё требует переноса и тестов; приложение не будет выдавать заглушку за активный прокси.",
+                    "TgTunnel предназначен только для Android. Linux используется исключительно для разработки и тестирования C++-ядра. Транспорт MTProto пока не реализован, поэтому локальный прокси ещё не запускается.",
                     color = TextSecondary,
                     fontSize = 11.sp
                 )
@@ -517,7 +517,7 @@ private fun Footer(onSettings: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        Text("TgTunnel · 0.2.0", color = TextSecondary, fontSize = 11.sp)
+        Text("TgTunnel · 0.2.0 · Android only", color = TextSecondary, fontSize = 11.sp)
         TextButton(onClick = onSettings) { Text("НАСТРОЙКИ", color = ConnectBlue, fontSize = 10.sp) }
     }
 }
