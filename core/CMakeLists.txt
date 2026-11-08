@@ -25,3 +25,11 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         -Wsign-conversion
     )
 endif()
+
+option(TGTUNNEL_BUILD_TESTS "Build TgTunnel core tests" OFF)
+if(TGTUNNEL_BUILD_TESTS)
+    enable_testing()
+    add_executable(tgtunnel-core-tests tests/engine_tests.cpp)
+    target_link_libraries(tgtunnel-core-tests PRIVATE tgtunnel_core)
+    add_test(NAME tgtunnel-core-tests COMMAND tgtunnel-core-tests)
+endif()
