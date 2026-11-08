@@ -44,6 +44,6 @@ ctest --test-dir build --output-on-failure
 
 ## Current limitation
 
-The Compose UI, settings persistence, JNI boundary and shared C++ build are in place. The MTProto transport has **not** yet been ported to C++. The native start operation intentionally returns an error instead of pretending that a proxy is connected. Do not use this build as a working Telegram proxy yet.
+The Compose UI, settings persistence, JNI boundary and shared C++ build are in place. The first native protocol layer now includes SHA-256, AES-256-CTR, client obfuscation-handshake decryption, and relay-init generation, backed by Mbed TLS 3.6.5. These primitives have compatibility tests, but they are **not yet wired into a TCP listener or WebSocket relay**. The native start operation intentionally returns an error instead of pretending that a proxy is connected. Do not use this build as a working Telegram proxy yet.
 
 The next implementation step is to port the transport/protocol modules from the preserved reference implementation into `core/`, with compatibility tests before enabling a successful connection state.

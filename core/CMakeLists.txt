@@ -1,9 +1,24 @@
 cmake_minimum_required(VERSION 3.22.1)
-project(tgtunnel_core LANGUAGES CXX)
+project(tgtunnel_core LANGUAGES C CXX)
+
+include(FetchContent)
+
+set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    mbedtls
+    GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
+    GIT_TAG v3.6.5
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(mbedtls)
 
 add_library(tgtunnel_core STATIC
     src/engine.cpp
     src/mtproto_handshake.cpp
+    src/mtproto_crypto.cpp
 )
 
 target_include_directories(tgtunnel_core
@@ -12,6 +27,7 @@ target_include_directories(tgtunnel_core
 )
 
 target_compile_features(tgtunnel_core PUBLIC cxx_std_17)
+target_link_libraries(tgtunnel_core PUBLIC mbedcrypto)
 
 set_target_properties(tgtunnel_core PROPERTIES
     POSITION_INDEPENDENT_CODE ON

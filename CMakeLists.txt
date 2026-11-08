@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22.1)
-project(TgTunnel LANGUAGES CXX)
+project(TgTunnel LANGUAGES C CXX)
 
 add_subdirectory(core)
 
