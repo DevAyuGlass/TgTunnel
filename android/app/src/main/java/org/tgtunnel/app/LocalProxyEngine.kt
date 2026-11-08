@@ -7,6 +7,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.URLEncoder
 import java.net.SocketException
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -38,6 +39,7 @@ internal object LocalProxyEngine {
     @Volatile private var listener: ServerSocket? = null
     @Volatile private var acceptThread: Thread? = null
     @Volatile private var logCallback: ((String) -> Unit)? = null
+    @Volatile private var workerDomains: List<String> = emptyList()
 
     private interface Upstream {
         fun socketForTracking(): Socket
@@ -196,13 +198,17 @@ internal object LocalProxyEngine {
         val telegramDecrypt: Cipher
     )
 
-    fun info(): String = "Android TLS WebSocket MTProto bridge"
+    fun info(): String = "Android MTProto bridge · Telegram WS + Cloudflare Worker fallback"
 
     fun isRunning(): Boolean = running.get()
 
-    fun start(port: Int, secretHex: String, onLog: (String) -> Unit): String {
+    fun start(port: Int, secretHex: String, workerDomain: String, onLog: (String) -> Unit): String {
         if (port !in 1..65535) return "ERR:Port must be between 1 and 65535"
         val secret = parseSecret(secretHex) ?: return "ERR:Secret must contain exactly 32 hexadecimal characters"
+        val configuredWorkers = parseWorkerDomains(workerDomain)
+        if (workerDomain.isNotBlank() && configuredWorkers.isEmpty()) {
+            return "ERR:Worker domain must be a hostname only (for example name.username.workers.dev)"
+        }
         synchronized(this) {
             if (running.get()) return "ERR:Proxy is already running"
             var server: ServerSocket? = null
@@ -212,6 +218,7 @@ internal object LocalProxyEngine {
                 boundServer.reuseAddress = true
                 boundServer.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 64)
                 logCallback = onLog
+                workerDomains = configuredWorkers
                 listener = boundServer
                 running.set(true)
                 acceptThread = Thread({ acceptLoop(boundServer, secret) }, "tgtunnel-accept").apply {
@@ -234,6 +241,7 @@ internal object LocalProxyEngine {
             if (!running.getAndSet(false)) return "Proxy is already stopped"
             runCatching { listener?.close() }
             listener = null
+            workerDomains = emptyList()
             activeClients.toList().forEach { runCatching { it.close() } }
             activeUpstreams.toList().forEach { runCatching { it.close() } }
             activeClients.clear()
@@ -374,6 +382,23 @@ internal object LocalProxyEngine {
             }
         }
 
+        val workers = workerDomains
+        if (workers.isNotEmpty()) {
+            for (worker in workers) {
+                for (destination in domains) {
+                    try {
+                        val path = "/apiws?dst=" + URLEncoder.encode(destination, "UTF-8")
+                        val upstream = connectWebSocket(worker, path)
+                        log("Connected to " + destination + " through Cloudflare Worker " + worker)
+                        return upstream
+                    } catch (error: Exception) {
+                        log("Cloudflare Worker " + worker + " for " + destination + " failed: " +
+                            (error.message ?: error.javaClass.simpleName))
+                    }
+                }
+            }
+        }
+
         val ip = when (handshake.dcId) {
             1 -> "149.154.175.50"
             2 -> "149.154.167.51"
@@ -396,7 +421,7 @@ internal object LocalProxyEngine {
         }
     }
 
-    private fun connectWebSocket(domain: String): WebSocketUpstream {
+    private fun connectWebSocket(domain: String, requestPath: String = "/apiws"): WebSocketUpstream {
         val socket = SSLSocketFactory.getDefault().createSocket(domain, 443) as SSLSocket
         try {
             socket.tcpNoDelay = true
@@ -409,7 +434,7 @@ internal object LocalProxyEngine {
             val keyBytes = ByteArray(16).also { random.nextBytes(it) }
             val key = Base64.encodeToString(keyBytes, Base64.NO_WRAP)
             val request = (
-                "GET /apiws HTTP/1.1\r\n" +
+                "GET " + requestPath + " HTTP/1.1\r\n" +
                 "Host: " + domain + "\r\n" +
                 "Upgrade: websocket\r\n" +
                 "Connection: Upgrade\r\n" +
@@ -455,6 +480,16 @@ internal object LocalProxyEngine {
             runCatching { socket.close() }
             throw error
         }
+    }
+
+    private fun parseWorkerDomains(value: String): List<String> {
+        if (value.isBlank()) return emptyList()
+        val hosts = value.split(',').map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+        val hostnamePattern = Regex("^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
+        if (hosts.size != hosts.distinct().size || hosts.any {
+                !hostnamePattern.matches(it) || "." !in it || ".." in it || it.startsWith(".")
+            }) return emptyList()
+        return hosts
     }
 
     private fun decodeHandshake(encrypted: ByteArray, secret: ByteArray): Handshake? {

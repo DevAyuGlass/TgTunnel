@@ -53,7 +53,7 @@ The Android application now includes a local TCP listener bound to `127.0.0.1`, 
 - The local listener is loopback-only; use the generated Telegram proxy link from the app.
 - The app process must remain alive while the local proxy is in use; a foreground service is not included yet.
 
-The current Android runtime does not include the upstream project's Cloudflare Worker/H2 fallback, Fake-TLS domain mode, or test-DC routing. Direct TCP is only a fallback when the WebSocket endpoint cannot be reached.
+If configured, a Cloudflare Worker is tried after Telegram's direct WebSocket endpoints and before direct DC TCP. The Worker hostname is optional; without it, the runtime retains the original Telegram WebSocket → direct TCP sequence. The app currently uses the Worker's WebSocket-to-TCP bridge only; HTTP/2 media multiplexing, Fake-TLS domain mode, and test-DC routing are not implemented.
 
 ## Native C++ core
 
@@ -68,3 +68,13 @@ cmake -S . -B build -DTGTUNNEL_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
+
+
+## Optional Cloudflare Worker fallback
+
+1. Create a Cloudflare Worker and deploy the source in [cloudflare/worker.js](cloudflare/worker.js).
+2. Copy its `workers.dev` hostname (or configured custom hostname).
+3. Open TGTunnel → Settings → Cloudflare Worker and paste the hostname without `https://`.
+4. Start the local proxy. If Telegram's direct WebSocket endpoints fail, TGTunnel will try the configured Worker before direct TCP.
+
+The Worker only accepts Telegram WebSocket DC hostnames and relays the encrypted MTProto stream; it does not decrypt Telegram traffic. Cloudflare account limits, network filtering of Cloudflare, and Worker availability can still prevent a connection.

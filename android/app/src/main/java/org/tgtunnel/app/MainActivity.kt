@@ -78,6 +78,7 @@ private const val KEY_PORT = "local_port"
 private const val KEY_AUTOSTART = "autostart"
 private const val KEY_VERBOSE = "verbose_logs"
 private const val KEY_SECRET = "mtproto_secret"
+private const val KEY_CF_WORKER = "cloudflare_worker_domain"
 
 private val logIds = AtomicLong(0)
 
@@ -88,7 +89,8 @@ private data class AppSettings(
     val port: String = "1443",
     val secret: String = "",
     val autostart: Boolean = false,
-    val verboseLogs: Boolean = false
+    val verboseLogs: Boolean = false,
+    val workerDomain: String = ""
 )
 
 private data class LogEntry(
@@ -119,7 +121,8 @@ private fun TgTunnelApp() {
                 port = preferences.getInt(KEY_PORT, 1443).toString(),
                 secret = preferences.getString(KEY_SECRET, null) ?: generateSecret().also { preferences.edit().putString(KEY_SECRET, it).apply() },
                 autostart = preferences.getBoolean(KEY_AUTOSTART, false),
-                verboseLogs = preferences.getBoolean(KEY_VERBOSE, false)
+                verboseLogs = preferences.getBoolean(KEY_VERBOSE, false),
+                workerDomain = preferences.getString(KEY_CF_WORKER, "") ?: ""
             )
         )
     }
@@ -143,6 +146,7 @@ private fun TgTunnelApp() {
             .putString(KEY_SECRET, next.secret)
             .putBoolean(KEY_AUTOSTART, next.autostart)
             .putBoolean(KEY_VERBOSE, next.verboseLogs)
+            .putString(KEY_CF_WORKER, next.workerDomain)
             .apply()
     }
 
@@ -159,7 +163,7 @@ private fun TgTunnelApp() {
             val port = settings.port.toIntOrNull()
             if (port != null && port in 1..65535) {
                 val result = withContext(Dispatchers.IO) {
-                    NativeBridge.start(port, settings.secret) { message ->
+                    NativeBridge.start(port, settings.secret, settings.workerDomain) { message ->
                         android.os.Handler(android.os.Looper.getMainLooper()).post { addLog(message) }
                     }
                 }
@@ -197,7 +201,7 @@ private fun TgTunnelApp() {
                                 connectionBusy = true
                                 scope.launch {
                                     val result = withContext(Dispatchers.IO) {
-                                        NativeBridge.start(port, settings.secret) { message ->
+                                        NativeBridge.start(port, settings.secret, settings.workerDomain) { message ->
                                             android.os.Handler(android.os.Looper.getMainLooper()).post { addLog(message) }
                                         }
                                     }
@@ -497,7 +501,7 @@ private fun EngineCard() {
             EngineRow("Платформа", "Android only")
             EngineRow("Язык движка", "C++")
             EngineRow("Интерфейс", "Kotlin + Compose")
-            EngineRow("Транспорт", "TLS WebSocket + TCP fallback", ConnectedGreen)
+            EngineRow("Транспорт", "Telegram WS + CF Worker + TCP", ConnectedGreen)
         }
     }
 }
@@ -583,6 +587,28 @@ private fun SettingsScreen(
         }
         item {
             SettingsPanel {
+                Text("CLOUDFLARE WORKER", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                OutlinedTextField(
+                    value = settings.workerDomain,
+                    onValueChange = { onSettingsChanged(settings.copy(workerDomain = it)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Домен Worker") },
+                    placeholder = { Text("name.username.workers.dev") },
+                    supportingText = {
+                        Text("Необязательно. Укажи домен своего Worker без https://; несколько доменов — через запятую.")
+                    },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
+                )
+                Text(
+                    "После неудачи Telegram WebSocket TGTunnel попробует подключиться через Worker, а затем — напрямую к DC.",
+                    color = TextSecondary,
+                    fontSize = 11.sp
+                )
+            }
+        }
+        item {
+            SettingsPanel {
                 Text("ПОВЕДЕНИЕ", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 SettingSwitch(
                     title = "Автозапуск",
@@ -603,7 +629,7 @@ private fun SettingsScreen(
                 Text("NATIVE CORE", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 Text(engineInfo, color = TextPrimary, fontSize = 13.sp)
                 Text(
-                    "Локальный TCP listener принимает MTProto, затем подключается к Telegram через TLS WebSocket с прямым TCP fallback.",
+                    "Локальный listener принимает MTProto. Движок пробует Telegram WebSocket, затем Cloudflare Worker (если настроен), затем прямой TCP.",
                     color = TextSecondary,
                     fontSize = 11.sp
                 )

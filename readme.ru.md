@@ -93,8 +93,9 @@ ctest --test-dir build --output-on-failure
 
 - Проект экспериментальный; успешная сборка APK не подтверждает работоспособность подключения в каждой сети.
 - Пока нет фонового foreground service: Android может завершить процесс приложения, если оно долго находится в фоне.
-- Не реализованы Cloudflare Worker/H2 fallback, Fake-TLS domain mode и test-DC routing из upstream-проекта.
-- Прямой TCP на порт 443 используется как резервный вариант после неудачи WebSocket.
+- Поддерживается резервный Cloudflare Worker WebSocket-to-TCP маршрут (нужен собственный Worker и его домен в настройках).
+- HTTP/2 media multiplexing, Fake-TLS domain mode и test-DC routing пока не реализованы.
+- Если Worker не настроен или недоступен, после неудачи Telegram WebSocket выполняется попытка прямого TCP на порт 443.
 - Linux-клиента нет; Linux нужен только для разработки и тестирования C++-ядра.
 
 ## Сообщить об ошибке
@@ -106,3 +107,18 @@ ctest --test-dir build --output-on-failure
 - полный журнал TGTunnel без MTProto secret и других личных данных.
 
 Не публикуйте свой MTProto secret: он является частью конфигурации прокси.
+
+
+## Cloudflare Worker (необязательно)
+
+Если провайдер блокирует прямое подключение к Telegram, можно попробовать отправлять трафик через Cloudflare Worker.
+
+1. Откройте Cloudflare Dashboard → **Workers & Pages** и создайте Worker.
+2. Замените его код содержимым файла [cloudflare/worker.js](cloudflare/worker.js) и нажмите **Deploy**.
+3. Скопируйте домен Worker, например `my-worker.username.workers.dev`.
+4. В TGTunnel откройте **Настройки → Cloudflare Worker** и вставьте домен без `https://`.
+5. Перезапустите прокси.
+
+После неудачи прямых Telegram WebSocket-соединений TGTunnel попробует Worker, а затем прямой TCP. Worker пересылает уже зашифрованный MTProto-поток и не расшифровывает сообщения. Cloudflare тоже может быть ограничен сетью или лимитами аккаунта, поэтому этот способ не гарантирует обход блокировки.
+
+Исходный протокол Worker основан на реализации [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy), MIT License; см. [cloudflare/NOTICE.md](cloudflare/NOTICE.md).
