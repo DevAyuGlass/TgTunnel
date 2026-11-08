@@ -50,6 +50,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private val Background = Color(0xFF0B1118)
 private val Panel = Color(0xFF151F2A)
@@ -110,6 +113,8 @@ private fun TgTunnelApp() {
     }
     var screen by remember { mutableStateOf(Screen.HOME) }
     var connectionState by remember { mutableStateOf(ConnectionState.DISCONNECTED) }
+    var connectionBusy by remember { mutableStateOf(false) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
     var logs by remember {
         mutableStateOf(
             listOf(
@@ -148,6 +153,7 @@ private fun TgTunnelApp() {
                     settings = settings,
                     state = connectionState,
                     logs = logs,
+                    busy = connectionBusy,
                     onSettings = { screen = Screen.SETTINGS },
                     onConnect = {
                         val port = settings.port.toIntOrNull()
@@ -155,19 +161,31 @@ private fun TgTunnelApp() {
                             connectionState = ConnectionState.ERROR
                             addLog("Некорректный порт")
                         } else {
-                            val result = NativeBridge.start(port)
-                            if (result.startsWith("OK:")) {
-                                connectionState = ConnectionState.CONNECTED
-                            } else {
-                                connectionState = ConnectionState.ERROR
+                            if (!connectionBusy) {
+                                connectionBusy = true
+                                scope.launch {
+                                    val result = withContext(Dispatchers.IO) { NativeBridge.start(port) }
+                                    connectionState = if (result.startsWith("OK:")) {
+                                        ConnectionState.CONNECTED
+                                    } else {
+                                        ConnectionState.ERROR
+                                    }
+                                    addLog(result.removePrefix("OK:").removePrefix("ERR:"))
+                                    connectionBusy = false
+                                }
                             }
-                            addLog(result.removePrefix("OK:").removePrefix("ERR:"))
                         }
                     },
                     onStop = {
-                        val result = NativeBridge.stop()
-                        connectionState = ConnectionState.DISCONNECTED
-                        addLog(result)
+                        if (!connectionBusy) {
+                            connectionBusy = true
+                            scope.launch {
+                                val result = withContext(Dispatchers.IO) { NativeBridge.stop() }
+                                connectionState = ConnectionState.DISCONNECTED
+                                addLog(result)
+                                connectionBusy = false
+                            }
+                        }
                     }
                 )
                 Screen.SETTINGS -> SettingsScreen(
@@ -186,22 +204,23 @@ private fun HomeScreen(
     settings: AppSettings,
     state: ConnectionState,
     logs: List<LogEntry>,
+    busy: Boolean,
     onSettings: () -> Unit,
     onConnect: () -> Unit,
     onStop: () -> Unit
 ) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 22.dp),
-        verticalArrangement = Arrangement.spacedBy(15.dp)
-    ) {
-        item(key = "header") {
-            Header(onSettings = onSettings)
-        }
+    Column(modifier = Modifier.fillMaxSize()) {
+        Header(onSettings = onSettings, state = state)
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            contentPadding = PaddingValues(horizontal = 20.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(15.dp)
+        ) {
         item(key = "connection") {
             ConnectionCard(
                 state = state,
                 port = settings.port,
+                busy = busy,
                 onConnect = onConnect,
                 onStop = onStop
             )
@@ -228,13 +247,17 @@ private fun HomeScreen(
         item(key = "logs-title") { SectionTitle("ЖУРНАЛ СОБЫТИЙ") }
         item(key = "logs") { LogsCard(logs) }
         item(key = "footer") { Footer(onSettings = onSettings) }
+        }
     }
 }
 
 @Composable
-private fun Header(onSettings: () -> Unit) {
+private fun Header(onSettings: () -> Unit, state: ConnectionState) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Panel)
+            .padding(horizontal = 20.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
@@ -246,11 +269,22 @@ private fun Header(onSettings: () -> Unit) {
             }
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text("TgTunnel", color = TextPrimary, fontSize = 23.sp, fontWeight = FontWeight.Bold)
-                Text("Telegram connectivity", color = TextSecondary, fontSize = 11.sp)
+                Text("MTProto · Android", color = TextSecondary, fontSize = 11.sp)
             }
         }
-        TextButton(onClick = onSettings) {
-            Text("⚙", color = TextPrimary, fontSize = 22.sp)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            Box(
+                Modifier.size(8.dp).background(
+                    when (state) {
+                        ConnectionState.CONNECTED -> ConnectedGreen
+                        ConnectionState.ERROR -> ErrorRed
+                        ConnectionState.DISCONNECTED -> TextSecondary
+                    }, CircleShape
+                )
+            )
+            TextButton(onClick = onSettings) {
+                Text("⚙", color = TextPrimary, fontSize = 22.sp)
+            }
         }
     }
 }
@@ -259,6 +293,7 @@ private fun Header(onSettings: () -> Unit) {
 private fun ConnectionCard(
     state: ConnectionState,
     port: String,
+    busy: Boolean,
     onConnect: () -> Unit,
     onStop: () -> Unit
 ) {
@@ -307,6 +342,7 @@ private fun ConnectionCard(
             Spacer(Modifier.height(4.dp))
             Button(
                 onClick = if (state == ConnectionState.CONNECTED) onStop else onConnect,
+                enabled = !busy,
                 modifier = Modifier.fillMaxWidth().height(58.dp),
                 shape = RoundedCornerShape(17.dp),
                 colors = ButtonDefaults.buttonColors(
@@ -316,7 +352,11 @@ private fun ConnectionCard(
                 elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp, pressedElevation = 0.dp)
             ) {
                 Text(
-                    if (state == ConnectionState.CONNECTED) "ОТКЛЮЧИТЬСЯ" else "ПОДКЛЮЧИТЬСЯ",
+                    when {
+                        busy -> "ЗАПУСК..."
+                        state == ConnectionState.CONNECTED -> "ОТКЛЮЧИТЬСЯ"
+                        else -> "ПОДКЛЮЧИТЬСЯ"
+                    },
                     fontSize = 14.sp,
                     fontWeight = FontWeight.ExtraBold,
                     letterSpacing = 1.sp
@@ -409,21 +449,20 @@ private fun SettingsScreen(
     onBack: () -> Unit,
     onSettingsChanged: (AppSettings) -> Unit
 ) {
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 22.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text("Настройки", color = TextPrimary, fontSize = 25.sp, fontWeight = FontWeight.Bold)
-                TextButton(onClick = onBack) { Text("ГОТОВО", color = ConnectBlue) }
-            }
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().background(Panel).padding(horizontal = 20.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text("Настройки", color = TextPrimary, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            TextButton(onClick = onBack) { Text("ГОТОВО", color = ConnectBlue) }
         }
+        LazyColumn(
+            modifier = Modifier.weight(1f),
+            contentPadding = PaddingValues(horizontal = 20.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
         item {
             SettingsPanel {
                 Text("ЛОКАЛЬНЫЙ ПРОКСИ", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
@@ -464,7 +503,7 @@ private fun SettingsScreen(
                 Text("NATIVE CORE", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 Text(engineInfo, color = TextPrimary, fontSize = 13.sp)
                 Text(
-                    "TgTunnel предназначен только для Android. Linux используется исключительно для разработки и тестирования C++-ядра. Транспорт MTProto пока не реализован, поэтому локальный прокси ещё не запускается.",
+                    "TgTunnel предназначен только для Android. Криптографические примитивы MTProto уже подключены к native core; локальный listener и WebSocket relay ещё проходят интеграцию.",
                     color = TextSecondary,
                     fontSize = 11.sp
                 )
@@ -474,6 +513,7 @@ private fun SettingsScreen(
             TextButton(onClick = onBack, modifier = Modifier.fillMaxWidth()) {
                 Text("Назад", color = ConnectBlue)
             }
+        }
         }
     }
 }
