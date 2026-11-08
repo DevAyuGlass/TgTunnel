@@ -548,6 +548,7 @@ private fun SettingsScreen(
     onBack: () -> Unit,
     onSettingsChanged: (AppSettings) -> Unit
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
             modifier = Modifier.fillMaxWidth().statusBarsPadding().background(Panel).padding(horizontal = 20.dp, vertical = 14.dp),
@@ -606,6 +607,46 @@ private fun SettingsScreen(
                     color = TextSecondary,
                     fontSize = 11.sp
                 )
+            }
+        }
+        item {
+            SettingsPanel {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("ПРОЕКТ НА GITHUB", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Text("TGTunnel", color = TextPrimary, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Text("↗", color = ConnectBlue, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                }
+                Text(
+                    "Исходный код, новые версии и сообщения об ошибках — всё в репозитории проекта.",
+                    color = TextSecondary,
+                    fontSize = 11.sp
+                )
+                Text(
+                    "github.com/DevAyuGlass/TgTunnel",
+                    color = ConnectBlue,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                TextButton(
+                    onClick = {
+                        try {
+                            context.startActivity(
+                                Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/DevAyuGlass/TgTunnel"))
+                            )
+                        } catch (_: android.content.ActivityNotFoundException) {
+                            Toast.makeText(context, "Не удалось открыть ссылку", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("ОТКРЫТЬ РЕПОЗИТОРИЙ", color = ConnectBlue, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                }
             }
         }
         item {
