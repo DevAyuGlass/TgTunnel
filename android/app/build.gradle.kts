@@ -4,6 +4,17 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+val releaseStoreFile = System.getenv("RELEASE_STORE_FILE")
+val releaseStorePassword = System.getenv("RELEASE_STORE_PASSWORD")
+val releaseKeyAlias = System.getenv("RELEASE_KEY_ALIAS")
+val releaseKeyPassword = System.getenv("RELEASE_KEY_PASSWORD")
+val hasReleaseSigning = listOf(
+    releaseStoreFile,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword
+).all { !it.isNullOrBlank() }
+
 android {
     namespace = "org.tgtunnel.app"
     compileSdk = 35
@@ -32,6 +43,17 @@ android {
         }
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            create("release") {
+                storeFile = file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         debug {
             // Keep debug symbols and checks for development.
@@ -39,6 +61,9 @@ android {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
