@@ -2,7 +2,7 @@ name: Android Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feat/**"]
   pull_request:
   workflow_dispatch:
 
@@ -21,29 +21,36 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.13"
-
       - uses: android-actions/setup-android@v3
         with:
           packages: 'platform-tools'
 
-      - name: Install Android SDK
+      - name: Install Android SDK, NDK and CMake
         run: |
           yes | sdkmanager --licenses
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          sdkmanager \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.11.1"
 
-      - name: Build APK
-        run: gradle --no-daemon -p android :app:assembleDebug
+      - name: Build debug and optimized release APKs
+        run: gradle --no-daemon -p android :app:assembleDebug :app:assembleRelease
 
       - uses: actions/upload-artifact@v4
         with:
           name: TgTunnel-debug
           path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TgTunnel-release
+          path: android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
           retention-days: 14
