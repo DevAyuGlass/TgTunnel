@@ -1,7 +1,10 @@
 package org.tgtunnel.app
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -412,6 +415,7 @@ private fun ConnectionCard(
 @Composable
 private fun SecretCard(secret: String, port: String) {
     val clipboard = LocalClipboardManager.current
+    val context = androidx.compose.ui.platform.LocalContext.current
     val link = "tg://proxy?server=127.0.0.1&port=" + port + "&secret=dd" + secret
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -422,9 +426,34 @@ private fun SecretCard(secret: String, port: String) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
             Text("СЕКРЕТ MTProto", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
             Text("dd" + secret, color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-            Text("Добавь этот локальный прокси в Telegram. Ссылка использует 127.0.0.1 и порт " + port + ".", color = TextSecondary, fontSize = 11.sp)
-            TextButton(onClick = { clipboard.setText(AnnotatedString(link)) }) {
-                Text("КОПИРОВАТЬ ССЫЛКУ TELEGRAM", color = ConnectBlue, fontSize = 10.sp)
+            Text(
+                "Ссылка добавляет локальный прокси в Telegram на этом устройстве (127.0.0.1:$port). После открытия подтверди подключение в Telegram.",
+                color = TextSecondary,
+                fontSize = 11.sp
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(
+                    onClick = { clipboard.setText(AnnotatedString(link)) },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("КОПИРОВАТЬ tg://", color = ConnectBlue, fontSize = 10.sp)
+                }
+                TextButton(
+                    onClick = {
+                        try {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(link)))
+                        } catch (_: android.content.ActivityNotFoundException) {
+                            Toast.makeText(context, "Telegram не найден", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("ОТКРЫТЬ В TELEGRAM", color = ConnectBlue, fontSize = 10.sp)
+                }
             }
         }
     }
