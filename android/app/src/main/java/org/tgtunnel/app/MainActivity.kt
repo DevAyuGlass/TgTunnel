@@ -3,6 +3,7 @@ package org.tgtunnel.app
 import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -33,7 +35,10 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -50,6 +55,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
+import java.security.SecureRandom
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -68,6 +74,7 @@ private const val PREFS_NAME = "tgtunnel_settings"
 private const val KEY_PORT = "local_port"
 private const val KEY_AUTOSTART = "autostart"
 private const val KEY_VERBOSE = "verbose_logs"
+private const val KEY_SECRET = "mtproto_secret"
 
 private val logIds = AtomicLong(0)
 
@@ -76,6 +83,7 @@ private enum class ConnectionState { DISCONNECTED, CONNECTED, ERROR }
 
 private data class AppSettings(
     val port: String = "1443",
+    val secret: String = "",
     val autostart: Boolean = false,
     val verboseLogs: Boolean = false
 )
@@ -106,6 +114,7 @@ private fun TgTunnelApp() {
         mutableStateOf(
             AppSettings(
                 port = preferences.getInt(KEY_PORT, 1443).toString(),
+                secret = preferences.getString(KEY_SECRET, null) ?: generateSecret().also { preferences.edit().putString(KEY_SECRET, it).apply() },
                 autostart = preferences.getBoolean(KEY_AUTOSTART, false),
                 verboseLogs = preferences.getBoolean(KEY_VERBOSE, false)
             )
@@ -128,6 +137,7 @@ private fun TgTunnelApp() {
         settings = next
         preferences.edit()
             .putInt(KEY_PORT, next.port.toIntOrNull() ?: 1443)
+            .putString(KEY_SECRET, next.secret)
             .putBoolean(KEY_AUTOSTART, next.autostart)
             .putBoolean(KEY_VERBOSE, next.verboseLogs)
             .apply()
@@ -135,6 +145,25 @@ private fun TgTunnelApp() {
 
     fun addLog(message: String) {
         logs = (listOf(newLog(message)) + logs).take(50)
+    }
+
+    BackHandler(enabled = screen != Screen.HOME) { screen = Screen.HOME }
+
+    LaunchedEffect(Unit) {
+        if (NativeBridge.isRunning()) {
+            connectionState = ConnectionState.CONNECTED
+        } else if (settings.autostart) {
+            val port = settings.port.toIntOrNull()
+            if (port != null && port in 1..65535) {
+                val result = withContext(Dispatchers.IO) {
+                    NativeBridge.start(port, settings.secret) { message ->
+                        android.os.Handler(android.os.Looper.getMainLooper()).post { addLog(message) }
+                    }
+                }
+                connectionState = if (result.startsWith("OK:")) ConnectionState.CONNECTED else ConnectionState.ERROR
+                addLog("Автозапуск: " + result.removePrefix("OK:").removePrefix("ERR:"))
+            }
+        }
     }
 
     MaterialTheme(
@@ -164,7 +193,11 @@ private fun TgTunnelApp() {
                             if (!connectionBusy) {
                                 connectionBusy = true
                                 scope.launch {
-                                    val result = withContext(Dispatchers.IO) { NativeBridge.start(port) }
+                                    val result = withContext(Dispatchers.IO) {
+                                        NativeBridge.start(port, settings.secret) { message ->
+                                            android.os.Handler(android.os.Looper.getMainLooper()).post { addLog(message) }
+                                        }
+                                    }
                                     connectionState = if (result.startsWith("OK:")) {
                                         ConnectionState.CONNECTED
                                     } else {
@@ -242,6 +275,7 @@ private fun HomeScreen(
                 )
             }
         }
+        item(key = "secret") { SecretCard(secret = settings.secret, port = settings.port) }
         item(key = "engine-title") { SectionTitle("ДВИЖОК") }
         item(key = "engine") { EngineCard() }
         item(key = "logs-title") { SectionTitle("ЖУРНАЛ СОБЫТИЙ") }
@@ -256,6 +290,7 @@ private fun Header(onSettings: () -> Unit, state: ConnectionState) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .statusBarsPadding()
             .background(Panel)
             .padding(horizontal = 20.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -307,12 +342,12 @@ private fun ConnectionCard(
         ConnectionState.DISCONNECTED -> TextSecondary
     }
     val statusText = when (state) {
-        ConnectionState.CONNECTED -> "Подключено"
+        ConnectionState.CONNECTED -> "Прокси запущен"
         ConnectionState.ERROR -> "Ошибка запуска"
         ConnectionState.DISCONNECTED -> "Отключено"
     }
     val description = when (state) {
-        ConnectionState.CONNECTED -> "Прокси сообщил об успешном запуске"
+        ConnectionState.CONNECTED -> "Локальный порт слушает; Telegram подключится при первом запросе"
         ConnectionState.ERROR -> "Движок не смог запустить прокси"
         ConnectionState.DISCONNECTED -> "Локальный MTProto-прокси не запущен"
     }
@@ -373,6 +408,33 @@ private fun ConnectionCard(
     }
 }
 
+
+@Composable
+private fun SecretCard(secret: String, port: String) {
+    val clipboard = LocalClipboardManager.current
+    val link = "tg://proxy?server=127.0.0.1&port=" + port + "&secret=dd" + secret
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Panel),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+            Text("СЕКРЕТ MTProto", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+            Text("dd" + secret, color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text("Добавь этот локальный прокси в Telegram. Ссылка использует 127.0.0.1 и порт " + port + ".", color = TextSecondary, fontSize = 11.sp)
+            TextButton(onClick = { clipboard.setText(AnnotatedString(link)) }) {
+                Text("КОПИРОВАТЬ ССЫЛКУ TELEGRAM", color = ConnectBlue, fontSize = 10.sp)
+            }
+        }
+    }
+}
+
+private fun generateSecret(): String {
+    val bytes = ByteArray(16).also { SecureRandom().nextBytes(it) }
+    return bytes.joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+}
+
 @Composable
 private fun SectionTitle(title: String) {
     Text(title, color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
@@ -406,7 +468,7 @@ private fun EngineCard() {
             EngineRow("Платформа", "Android only")
             EngineRow("Язык движка", "C++")
             EngineRow("Интерфейс", "Kotlin + Compose")
-            EngineRow("Состояние", "MTProto transport не реализован", ErrorRed)
+            EngineRow("Транспорт", "TLS WebSocket + TCP fallback", ConnectedGreen)
         }
     }
 }
@@ -451,7 +513,7 @@ private fun SettingsScreen(
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
-            modifier = Modifier.fillMaxWidth().background(Panel).padding(horizontal = 20.dp, vertical = 14.dp),
+            modifier = Modifier.fillMaxWidth().statusBarsPadding().background(Panel).padding(horizontal = 20.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
@@ -503,7 +565,7 @@ private fun SettingsScreen(
                 Text("NATIVE CORE", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 Text(engineInfo, color = TextPrimary, fontSize = 13.sp)
                 Text(
-                    "TgTunnel предназначен только для Android. Криптографические примитивы MTProto уже подключены к native core; локальный listener и WebSocket relay ещё проходят интеграцию.",
+                    "Локальный TCP listener принимает MTProto, затем подключается к Telegram через TLS WebSocket с прямым TCP fallback.",
                     color = TextSecondary,
                     fontSize = 11.sp
                 )

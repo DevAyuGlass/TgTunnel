@@ -1,31 +1,17 @@
 package org.tgtunnel.app
 
 /**
- * Thin JNI boundary. The UI never performs proxy work on the main thread.
- * The current native core is an integration scaffold; it deliberately refuses
- * to report a successful connection until the MTProto transport is implemented.
+ * Public app-facing proxy API. The Android transport uses the platform TLS
+ * trust store and Java crypto provider; the C++ core remains independently
+ * built and covered by native compatibility tests.
  */
 internal object NativeBridge {
-    private val loaded: Boolean = runCatching {
-        System.loadLibrary("tgtunnel")
-    }.isSuccess
+    fun info(): String = LocalProxyEngine.info()
 
-    fun info(): String =
-        if (!loaded) "Native library failed to load"
-        else runCatching { nativeEngineInfo() }
-            .getOrElse { "Native core error: ${it.message ?: "unknown"}" }
+    fun isRunning(): Boolean = LocalProxyEngine.isRunning()
 
-    fun start(port: Int): String =
-        if (!loaded) "ERR:Native library is unavailable"
-        else runCatching { nativeStartProxy(port) }
-            .getOrElse { "ERR:Native start failed: ${it.message ?: "unknown"}" }
+    fun start(port: Int, secret: String, onLog: (String) -> Unit): String =
+        LocalProxyEngine.start(port, secret, onLog)
 
-    fun stop(): String =
-        if (!loaded) "Native library is unavailable"
-        else runCatching { nativeStopProxy() }
-            .getOrElse { "Native stop failed: ${it.message ?: "unknown"}" }
-
-    private external fun nativeEngineInfo(): String
-    private external fun nativeStartProxy(port: Int): String
-    private external fun nativeStopProxy(): String
+    fun stop(): String = LocalProxyEngine.stop()
 }

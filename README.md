@@ -42,8 +42,29 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-## Current limitation
+## Android proxy runtime
 
-The Compose UI, settings persistence, JNI boundary and shared C++ build are in place. The first native protocol layer now includes SHA-256, AES-256-CTR, client obfuscation-handshake decryption, and relay-init generation, backed by Mbed TLS 3.6.5. These primitives have compatibility tests, but they are **not yet wired into a TCP listener or WebSocket relay**. The native start operation intentionally returns an error instead of pretending that a proxy is connected. Do not use this build as a working Telegram proxy yet.
+The Android application now includes a local TCP listener bound to `127.0.0.1`, MTProto obfuscated-handshake validation, AES-CTR stream transformation, and an upstream transport that tries Telegram's TLS WebSocket endpoint (`kws{dc}.web.telegram.org/apiws)) before falling back to direct Telegram DC TCP on port 443.
 
-The next implementation step is to port the transport/protocol modules from the preserved reference implementation into `core/`, with compatibility tests before enabling a successful connection state.
+- Generates and persists a 16-byte MTProto secret locally.
+- Supports Telegram DC 1–5 and DC 203 (mapped to DC2 for the WebSocket hostname).
+- Supports abridged, intermediate, and padded-intermediate obfuscation tags.
+- Uses Android's TLS trust store and hostname verification for WebSocket connections.
+- The local listener is loopback-only; use the generated Telegram proxy link from the app.
+- The app process must remain alive while the local proxy is in use; a foreground service is not included yet.
+
+The current Android runtime does not include the upstream project's Cloudflare Worker/H2 fallback, Fake-TLS domain mode, or test-DC routing. Direct TCP is only a fallback when the WebSocket endpoint cannot be reached.
+
+## Native C++ core
+
+The C++17 core remains separately built and tested with Mbed TLS 3.6.5. It contains the protocol handshake and cryptographic primitives, but the current Android listener/transport path is implemented in Kotlin using Android's platform TLS and crypto providers. The C++ transport lifecycle is not yet used by the Android runtime.
+
+## Linux development tests
+
+Linux can build and test the platform-independent C++ core, but this is not a supported end-user platform:
+
+```sh
+cmake -S . -B build -DTGTUNNEL_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
