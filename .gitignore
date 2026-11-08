@@ -1,9 +1,19 @@
+# Gradle / Android
+.gradle/
+**/build/
+**/.cxx/
+local.properties
 
-# Python cache
+# CMake
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+
+# IDE
+.idea/
+*.iml
+
+# Python reference caches
 __pycache__/
 *.py[cod]
-
-# Gradle
-.gradle/
-build/
-local.properties
