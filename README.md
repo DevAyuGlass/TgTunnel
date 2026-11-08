@@ -1,6 +1,11 @@
 # TgTunnel
 
-TgTunnel is an Android + Linux client project for a local Telegram MTProto proxy.
+TgTunnel is an **Android-only** client project for a local Telegram MTProto proxy.
+
+## Supported platform
+
+- **Android only** — the user-facing application is built for Android.
+- Linux is used only as a development environment for building and testing the shared C++ core. There is no supported Linux desktop client.
 
 ## Current architecture
 
@@ -8,7 +13,6 @@ TgTunnel is an Android + Linux client project for a local Telegram MTProto proxy
 - Native layer: C++17
 - Android bridge: JNI
 - Native build: CMake + Android NDK
-- Linux entry point: CMake CLI
 - Python source under `third_party/tg-ws-proxy-reference/` is preserved only as a protocol-porting reference. It is not bundled or executed by Android.
 
 ## Build Android APKs
@@ -28,15 +32,15 @@ Supported Android ABIs:
 
 Use the release APK for performance testing. Debug builds are not representative of release rendering and runtime performance.
 
-## Build the portable C++ core on Linux
+## Linux development tests
+
+Linux can build and test the platform-independent C++ core, but this is not a supported end-user platform:
 
 ```sh
 cmake -S . -B build -DTGTUNNEL_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
-
-The CLI currently supports `--info` and a guarded `start <port>` entry point.
 
 ## Current limitation
 
