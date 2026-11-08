@@ -3,6 +3,7 @@ project(tgtunnel_core LANGUAGES CXX)
 
 add_library(tgtunnel_core STATIC
     src/engine.cpp
+    src/mtproto_handshake.cpp
 )
 
 target_include_directories(tgtunnel_core
