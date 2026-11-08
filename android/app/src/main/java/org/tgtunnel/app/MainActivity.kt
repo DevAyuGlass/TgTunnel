@@ -127,7 +127,7 @@ private fun TgTunnelApp() {
     var logs by remember {
         mutableStateOf(
             listOf(
-                newLog("TgTunnel запущен"),
+                newLog("TGTunnel запущен"),
                 newLog("Ожидание подключения")
             )
         )
@@ -303,7 +303,7 @@ private fun Header(onSettings: () -> Unit, state: ConnectionState) {
                 }
             }
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text("TgTunnel", color = TextPrimary, fontSize = 23.sp, fontWeight = FontWeight.Bold)
+                Text("TGTunnel", color = TextPrimary, fontSize = 23.sp, fontWeight = FontWeight.Bold)
                 Text("MTProto · Android", color = TextSecondary, fontSize = 11.sp)
             }
         }
@@ -487,6 +487,8 @@ private fun EngineRow(title: String, value: String, valueColor: Color = TextPrim
 
 @Composable
 private fun LogsCard(logs: List<LogEntry>) {
+    val clipboard = LocalClipboardManager.current
+    val logText = logs.asReversed().joinToString("\\n") { "[${it.time}] ${it.message}" }
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
@@ -499,6 +501,12 @@ private fun LogsCard(logs: List<LogEntry>) {
                     Text(entry.time, color = ConnectBlue, fontSize = 10.sp)
                     Text(entry.message, color = TextPrimary, fontSize = 12.sp)
                 }
+            }
+            TextButton(
+                onClick = { clipboard.setText(AnnotatedString(logText)) },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("КОПИРОВАТЬ ЛОГ", color = ConnectBlue, fontSize = 10.sp, fontWeight = FontWeight.Bold)
             }
         }
     }
@@ -619,7 +627,7 @@ private fun Footer(onSettings: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        Text("TgTunnel · 0.2.0 · Android only", color = TextSecondary, fontSize = 11.sp)
+        Text("TGTunnel · 0.3.0 · Android only", color = TextSecondary, fontSize = 11.sp)
         TextButton(onClick = onSettings) { Text("НАСТРОЙКИ", color = ConnectBlue, fontSize = 10.sp) }
     }
 }
