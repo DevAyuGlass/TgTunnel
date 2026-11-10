@@ -3,12 +3,18 @@ package org.tgtunnel.app
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
-import java.net.URLEncoder
 import java.net.SocketException
+import java.net.UnknownHostException
+import java.net.URLEncoder
+import java.net.HttpURLConnection
+import java.net.URL
 import java.security.MessageDigest
 import java.security.SecureRandom
 import android.util.Base64
@@ -17,6 +23,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
@@ -41,7 +48,12 @@ internal object LocalProxyEngine {
     @Volatile private var logCallback: ((String) -> Unit)? = null
     @Volatile private var workerDomains: List<String> = emptyList()
     @Volatile private var cloudflareProxyEnabled: Boolean = true
+    @Volatile private var cfProxyDomains: List<String> = emptyList()
+    @Volatile private var cfProxyRefreshThread: Thread? = null
     private val activeCfProxyDomains = ConcurrentHashMap<Int, String>()
+    private val cfProxyFailures = ConcurrentHashMap<String, Int>()
+    private val cfProxyRetryAfter = ConcurrentHashMap<String, Long>()
+    private val dnsCache = ConcurrentHashMap<String, Pair<Long, List<InetAddress>>>()
 
     // Encoded list and decoding are kept compatible with Flowseal's upstream
     // config.py. A built-in list lets the fallback work before GitHub refresh.
@@ -52,7 +64,7 @@ internal object LocalProxyEngine {
         "ulihssf.com", "tmhqsdqmfpmk.com", "xwuwoqbm.com", "orgcnunpj.com",
         "zhkuldz.com", "zypoljnslxa.com", "efabnxaowuzs.com", "zaftuzsftqdq.com"
     )
-    private val cfProxyDomains = encodedCfProxyDomains.map(::decodeCfProxyDomain)
+    private val defaultCfProxyDomains = encodedCfProxyDomains.map(::decodeCfProxyDomain)
 
     private interface Upstream {
         fun socketForTracking(): Socket
@@ -233,13 +245,17 @@ internal object LocalProxyEngine {
                 logCallback = onLog
                 workerDomains = configuredWorkers
                 cloudflareProxyEnabled = cfProxyEnabled
+                cfProxyDomains = defaultCfProxyDomains
                 activeCfProxyDomains.clear()
+                cfProxyFailures.clear()
+                cfProxyRetryAfter.clear()
                 listener = boundServer
                 running.set(true)
                 acceptThread = Thread({ acceptLoop(boundServer, secret) }, "tgtunnel-accept").apply {
                     isDaemon = true
                     start()
                 }
+                if (cfProxyEnabled) startCfProxyDomainRefresh()
                 log("Local listener started on 127.0.0.1:" + port)
                 "OK:Listening on 127.0.0.1:" + port
             } catch (error: Exception) {
@@ -258,7 +274,13 @@ internal object LocalProxyEngine {
             listener = null
             workerDomains = emptyList()
             cloudflareProxyEnabled = false
+            cfProxyRefreshThread?.interrupt()
+            cfProxyRefreshThread = null
+            cfProxyDomains = emptyList()
             activeCfProxyDomains.clear()
+            cfProxyFailures.clear()
+            cfProxyRetryAfter.clear()
+            dnsCache.clear()
             activeClients.toList().forEach { runCatching { it.close() } }
             activeUpstreams.toList().forEach { runCatching { it.close() } }
             activeClients.clear()
@@ -404,7 +426,8 @@ internal object LocalProxyEngine {
             for (worker in workers) {
                 for (destination in domains) {
                     try {
-                        val path = "/apiws?dst=" + URLEncoder.encode(destination, "UTF-8")
+                        val path = "/apiws?dst=" + URLEncoder.encode(destination, "UTF-8") +
+                            "&dc=" + dcForDomain
                         val upstream = connectWebSocket(worker, path)
                         log("Connected to " + destination + " through Cloudflare Worker " + worker)
                         return upstream
@@ -420,19 +443,31 @@ internal object LocalProxyEngine {
         // It is independent from the optional user-owned Worker tunnel above.
         if (cloudflareProxyEnabled) {
             val preferred = activeCfProxyDomains[dcForDomain]
+            val now = System.currentTimeMillis()
             val candidates = buildList {
-                if (preferred != null) add(preferred)
-                addAll(cfProxyDomains.shuffled().filter { it != preferred })
+                if (preferred != null && (cfProxyRetryAfter[preferred] ?: 0L) <= now) add(preferred)
+                addAll(cfProxyDomains.shuffled().filter {
+                    it != preferred && (cfProxyRetryAfter[it] ?: 0L) <= now
+                })
             }
-            for (baseDomain in candidates) {
+            if (candidates.isEmpty()) {
+                log("Cloudflare Proxy pool is cooling down; retrying with the full pool")
+            }
+            for (baseDomain in candidates.ifEmpty { cfProxyDomains.shuffled() }) {
                 val host = "kws" + dcForDomain + "." + baseDomain
                 try {
                     val upstream = connectWebSocket(host)
                     activeCfProxyDomains[dcForDomain] = baseDomain
+                    cfProxyFailures.remove(baseDomain)
+                    cfProxyRetryAfter.remove(baseDomain)
                     log("Connected to DC" + handshake.dcId + " through Cloudflare Proxy (" + baseDomain + ")")
                     return upstream
                 } catch (error: Exception) {
-                    log("Cloudflare Proxy " + baseDomain + " failed: " +
+                    val failures = (cfProxyFailures[baseDomain] ?: 0) + 1
+                    cfProxyFailures[baseDomain] = failures
+                    val backoffSeconds = minOf(300L, 5L shl minOf(failures - 1, 5))
+                    cfProxyRetryAfter[baseDomain] = System.currentTimeMillis() + backoffSeconds * 1000L
+                    log("Cloudflare Proxy " + baseDomain + " failed (retry in " + backoffSeconds + "s): " +
                         (error.message ?: error.javaClass.simpleName))
                 }
             }
@@ -461,15 +496,8 @@ internal object LocalProxyEngine {
     }
 
     private fun connectWebSocket(domain: String, requestPath: String = "/apiws"): WebSocketUpstream {
-        val socket = SSLSocketFactory.getDefault().createSocket(domain, 443) as SSLSocket
+        val socket = connectTlsSocketIpv4First(domain)
         try {
-            socket.tcpNoDelay = true
-            socket.soTimeout = 12000
-            val parameters = socket.sslParameters
-            parameters.endpointIdentificationAlgorithm = "HTTPS"
-            socket.sslParameters = parameters
-            socket.startHandshake()
-
             val keyBytes = ByteArray(16).also { random.nextBytes(it) }
             val key = Base64.encodeToString(keyBytes, Base64.NO_WRAP)
             val request = (
@@ -519,6 +547,204 @@ internal object LocalProxyEngine {
             runCatching { socket.close() }
             throw error
         }
+    }
+
+    /**
+     * Prefer IPv4 because many Android/mobile networks advertise AAAA records
+     * without a usable IPv6 route. If Android DNS fails, query public DNS over
+     * UDP directly, while retaining the hostname for TLS SNI and verification.
+     */
+    private fun connectTlsSocketIpv4First(domain: String): SSLSocket {
+        val addresses = resolveIpv4(domain)
+        var lastError: Exception? = null
+        for (address in addresses) {
+            val raw = Socket()
+            try {
+                raw.tcpNoDelay = true
+                raw.connect(InetSocketAddress(address, 443), 7000)
+                val ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory)
+                    .createSocket(raw, domain, 443, true) as SSLSocket
+                ssl.soTimeout = 12000
+                val parameters = ssl.sslParameters
+                parameters.endpointIdentificationAlgorithm = "HTTPS"
+                parameters.serverNames = listOf(SNIHostName(domain))
+                ssl.sslParameters = parameters
+                ssl.startHandshake()
+                return ssl
+            } catch (error: Exception) {
+                lastError = error
+                runCatching { raw.close() }
+            }
+        }
+        throw lastError ?: UnknownHostException("No IPv4 addresses for $domain")
+    }
+
+    private fun resolveIpv4(domain: String): List<InetAddress> {
+        val now = System.currentTimeMillis()
+        dnsCache[domain]?.let { cached ->
+            if (cached.first > now && cached.second.isNotEmpty()) return cached.second
+            dnsCache.remove(domain, cached)
+        }
+        val systemAddresses = runCatching {
+            InetAddress.getAllByName(domain).filterIsInstance<Inet4Address>()
+        }.getOrDefault(emptyList())
+        if (systemAddresses.isNotEmpty()) {
+            val result = systemAddresses.distinctBy { it.hostAddress }
+            dnsCache[domain] = (now + 60_000L) to result
+            return result
+        }
+
+        log("System DNS failed for " + domain + "; trying direct DNS over IPv4")
+        for (dnsServer in listOf("8.8.8.8", "1.1.1.1")) {
+            val queryId = random.nextInt(65536)
+            val query = buildDnsAQuery(domain, queryId)
+            try {
+                DatagramSocket().use { socket ->
+                    socket.soTimeout = 2200
+                    val server = InetAddress.getByName(dnsServer)
+                    socket.send(DatagramPacket(query, query.size, server, 53))
+                    val response = ByteArray(4096)
+                    val packet = DatagramPacket(response, response.size)
+                    socket.receive(packet)
+                    val parsed = parseDnsAResponse(packet.data.copyOf(packet.length), queryId, domain)
+                    if (parsed.isNotEmpty()) {
+                        dnsCache[domain] = (System.currentTimeMillis() + 60_000L) to parsed
+                        log("Resolved " + domain + " through fallback DNS " + dnsServer)
+                        return parsed
+                    }
+                }
+            } catch (error: Exception) {
+                log("Fallback DNS " + dnsServer + " failed for " + domain + ": " +
+                    (error.message ?: error.javaClass.simpleName))
+            }
+        }
+        throw UnknownHostException("Unable to resolve $domain using Android DNS or fallback DNS")
+    }
+
+    private fun buildDnsAQuery(domain: String, id: Int): ByteArray {
+        val output = ByteArrayOutputStream()
+        output.write((id ushr 8) and 0xff)
+        output.write(id and 0xff)
+        output.write(0x01); output.write(0x00)
+        output.write(0x00); output.write(0x01)
+        output.write(ByteArray(6))
+        domain.trimEnd('.').split('.').forEach { label ->
+            val bytes = label.toByteArray(Charsets.US_ASCII)
+            require(bytes.isNotEmpty() && bytes.size <= 63) { "Invalid DNS label" }
+            output.write(bytes.size)
+            output.write(bytes)
+        }
+        output.write(0)
+        output.write(0); output.write(1)
+        output.write(0); output.write(1)
+        return output.toByteArray()
+    }
+
+    private fun parseDnsAResponse(data: ByteArray, expectedId: Int, hostname: String): List<InetAddress> {
+        if (data.size < 12) return emptyList()
+        fun u16(offset: Int): Int =
+            ((data[offset].toInt() and 0xff) shl 8) or (data[offset + 1].toInt() and 0xff)
+        if (u16(0) != expectedId || (data[2].toInt() and 0x80) == 0 || (data[3].toInt() and 0x0f) != 0) {
+            return emptyList()
+        }
+        val questions = u16(4)
+        val answers = u16(6)
+        var offset = 12
+        repeat(questions) {
+            while (offset < data.size && data[offset].toInt() != 0) {
+                val length = data[offset].toInt() and 0xff
+                if ((length and 0xc0) == 0xc0) {
+                    offset += 2
+                    break
+                }
+                offset += length + 1
+            }
+            if (offset < data.size) offset++
+            offset += 4
+        }
+        val result = mutableListOf<InetAddress>()
+        repeat(answers) {
+            if (offset >= data.size) return@repeat
+            val first = data[offset].toInt() and 0xff
+            if ((first and 0xc0) == 0xc0) offset += 2
+            else {
+                while (offset < data.size && data[offset].toInt() != 0) {
+                    val length = data[offset].toInt() and 0xff
+                    offset += length + 1
+                }
+                offset++
+            }
+            if (offset + 10 > data.size) return@repeat
+            val type = u16(offset)
+            val clazz = u16(offset + 2)
+            offset += 8
+            val length = u16(offset)
+            offset += 2
+            if (offset + length > data.size) return@repeat
+            if (type == 1 && clazz == 1 && length == 4) {
+                result.add(InetAddress.getByAddress(hostname, data.copyOfRange(offset, offset + 4)))
+            }
+            offset += length
+        }
+        return result.distinctBy { it.hostAddress }
+    }
+
+    private fun startCfProxyDomainRefresh() {
+        cfProxyRefreshThread?.interrupt()
+        cfProxyRefreshThread = Thread({
+            while (running.get() && cloudflareProxyEnabled) {
+                refreshCfProxyDomains()
+                try {
+                    Thread.sleep(60L * 60L * 1000L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }, "tgtunnel-cf-domain-refresh").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun refreshCfProxyDomains() {
+        val url = "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt"
+        val connection = runCatching { URL(url).openConnection() as HttpURLConnection }.getOrNull() ?: return
+        try {
+            connection.connectTimeout = 8000
+            connection.readTimeout = 8000
+            connection.setRequestProperty("User-Agent", "TgTunnel-Android")
+            val fetched = connection.inputStream.bufferedReader(Charsets.UTF_8).useLines { lines ->
+                lines.map { it.trim() }
+                    .filter { it.isNotEmpty() && !it.startsWith("#") }
+                    .map(::decodeCfProxyDomain)
+                    .filter(::isValidDomain)
+                    .distinct()
+                    .toList()
+            }
+            if (fetched.size >= 3 && running.get() && cloudflareProxyEnabled) {
+                cfProxyDomains = fetched
+                activeCfProxyDomains.clear()
+                log("Cloudflare Proxy domain pool refreshed: " + fetched.size + " domains")
+            } else {
+                log("Cloudflare Proxy refresh returned too few valid domains; keeping current pool")
+            }
+        } catch (error: Exception) {
+            log("Cloudflare Proxy domain refresh failed; keeping built-in pool: " +
+                (error.message ?: error.javaClass.simpleName))
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun isValidDomain(domain: String): Boolean {
+        if (domain.isBlank() || domain.length > 253 || domain.startsWith(".") || domain.endsWith(".")) return false
+        val labels = domain.split(".")
+        if (labels.size < 2) return false
+        return labels.all { label ->
+            label.isNotEmpty() && label.length <= 63 &&
+                label.first() != '-' && label.last() != '-' &&
+                label.all { it.isLetterOrDigit() || it == '-' }
+        } && labels.last().length >= 2 && labels.last().any { it.isLetter() }
     }
 
     private fun decodeCfProxyDomain(encoded: String): String {
