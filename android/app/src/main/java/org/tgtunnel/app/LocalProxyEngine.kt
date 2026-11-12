@@ -3,8 +3,6 @@ package org.tgtunnel.app
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -23,6 +21,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import org.json.JSONObject
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
@@ -579,12 +578,18 @@ internal object LocalProxyEngine {
         throw lastError ?: UnknownHostException("No IPv4 addresses for $domain")
     }
 
+    /**
+     * Resolve IPv4 addresses without raw UDP sockets. Some Android builds/networks
+     * deny app-created UDP/53 sockets (EPERM), while HTTPS remains available.
+     * Keep the original hostname on the TLS socket for SNI and certificate checks.
+     */
     private fun resolveIpv4(domain: String): List<InetAddress> {
         val now = System.currentTimeMillis()
         dnsCache[domain]?.let { cached ->
             if (cached.first > now && cached.second.isNotEmpty()) return cached.second
             dnsCache.remove(domain, cached)
         }
+
         val systemAddresses = runCatching {
             InetAddress.getAllByName(domain).filterIsInstance<Inet4Address>()
         }.getOrDefault(emptyList())
@@ -594,31 +599,55 @@ internal object LocalProxyEngine {
             return result
         }
 
-        log("System DNS failed for " + domain + "; trying direct DNS over IPv4")
-        for (dnsServer in listOf("8.8.8.8", "1.1.1.1")) {
-            val queryId = random.nextInt(65536)
-            val query = buildDnsAQuery(domain, queryId)
+        log("System DNS failed for " + domain + "; trying DNS-over-HTTPS")
+        val providers = listOf(
+            "https://dns.google/resolve?name=",
+            "https://cloudflare-dns.com/dns-query?name="
+        )
+        for (provider in providers) {
+            var connection: HttpURLConnection? = null
             try {
-                DatagramSocket().use { socket ->
-                    socket.soTimeout = 2200
-                    val server = InetAddress.getByName(dnsServer)
-                    socket.send(DatagramPacket(query, query.size, server, 53))
-                    val response = ByteArray(4096)
-                    val packet = DatagramPacket(response, response.size)
-                    socket.receive(packet)
-                    val parsed = parseDnsAResponse(packet.data.copyOf(packet.length), queryId, domain)
-                    if (parsed.isNotEmpty()) {
-                        dnsCache[domain] = (System.currentTimeMillis() + 60_000L) to parsed
-                        log("Resolved " + domain + " through fallback DNS " + dnsServer)
-                        return parsed
+                val encodedName = URLEncoder.encode(domain, "UTF-8")
+                val url = URL(provider + encodedName + "&type=A")
+                connection = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 4500
+                    readTimeout = 4500
+                    useCaches = false
+                    setRequestProperty("Accept", "application/dns-json")
+                    setRequestProperty("User-Agent", "TGTunnel/1.0")
+                }
+                val status = connection.responseCode
+                if (status !in 200..299) {
+                    throw SocketException("DoH HTTP $status")
+                }
+                val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                val answers = JSONObject(body).optJSONArray("Answer") ?: continue
+                val addresses = buildList {
+                    for (index in 0 until answers.length()) {
+                        val answer = answers.optJSONObject(index) ?: continue
+                        if (answer.optInt("type") != 1) continue
+                        val value = answer.optString("data")
+                        val octets = value.split('.')
+                        if (octets.size != 4) continue
+                        val bytes = octets.map { it.toIntOrNull() ?: -1 }
+                        if (bytes.any { it !in 0..255 }) continue
+                        add(InetAddress.getByAddress(domain, bytes.map { it.toByte() }.toByteArray()))
                     }
+                }.distinctBy { it.hostAddress }
+                if (addresses.isNotEmpty()) {
+                    dnsCache[domain] = (System.currentTimeMillis() + 60_000L) to addresses
+                    log("Resolved " + domain + " through DNS-over-HTTPS (" + URL(provider).host + ")")
+                    return addresses
                 }
             } catch (error: Exception) {
-                log("Fallback DNS " + dnsServer + " failed for " + domain + ": " +
+                log("DNS-over-HTTPS " + URL(provider).host + " failed for " + domain + ": " +
                     (error.message ?: error.javaClass.simpleName))
+            } finally {
+                connection?.disconnect()
             }
         }
-        throw UnknownHostException("Unable to resolve $domain using Android DNS or fallback DNS")
+        throw UnknownHostException("Unable to resolve $domain using Android DNS or DNS-over-HTTPS")
     }
 
     private fun buildDnsAQuery(domain: String, id: Int): ByteArray {
