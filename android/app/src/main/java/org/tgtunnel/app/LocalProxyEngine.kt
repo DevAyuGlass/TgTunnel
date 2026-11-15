@@ -18,6 +18,8 @@ import java.security.SecureRandom
 import android.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -101,7 +103,11 @@ internal object LocalProxyEngine {
     ) : Upstream {
         val connectedAtMs: Long = System.currentTimeMillis()
         @Volatile var receivedBytes: Long = 0L
+        @Volatile var sentBytes: Long = 0L
         @Volatile var closedByPeer: Boolean = false
+        @Volatile var closeCode: Int? = null
+        @Volatile var closeReason: String = ""
+        @Volatile var upstreamFailure: String = ""
         @Volatile var upstreamFailed: Boolean = false
         override fun socketForTracking(): Socket = socket
         private val input: InputStream = socket.getInputStream()
@@ -139,6 +145,7 @@ internal object LocalProxyEngine {
                 for (i in payload.indices) masked[i] = (payload[i].toInt() xor mask[i and 3].toInt()).toByte()
                 output.write(masked)
                 output.flush()
+                sentBytes += length.toLong()
             }
         }
 
@@ -172,6 +179,8 @@ internal object LocalProxyEngine {
                             payload.copyOfRange(2, payload.size).toString(Charsets.UTF_8)
                         } else ""
                         closedByPeer = true
+                        this.closeCode = closeCode
+                        this.closeReason = closeReason
                         log("Upstream WebSocket CLOSE: code=" + (closeCode?.toString() ?: "none") +
                             if (closeReason.isNotEmpty()) " reason=" + closeReason else "")
                         runCatching { sendFrame(0x8, payload.take(2).toByteArray()) }
@@ -427,17 +436,40 @@ internal object LocalProxyEngine {
             ?.takeIf { it.splitFrames }
             ?.let { MtprotoMsgSplitter(transportTag) }
         val finished = AtomicBoolean(false)
+        val closeReason = AtomicReference("session ended")
+        val upBytes = AtomicLong(0L)
+        val downBytes = AtomicLong(0L)
+        val upPackets = AtomicLong(0L)
+        val downPackets = AtomicLong(0L)
+        val startedAt = System.currentTimeMillis()
         val clientInput = client.getInputStream()
         val clientOutput = client.getOutputStream()
+
         val upstreamToClient = Thread({
             try {
                 while (!finished.get() && running.get()) {
                     val data = try {
                         upstream.receive()
                     } catch (error: Exception) {
-                        (upstream as? WebSocketUpstream)?.upstreamFailed = true
+                        (upstream as? WebSocketUpstream)?.let {
+                            it.upstreamFailed = true
+                            it.upstreamFailure = error.message ?: error.javaClass.simpleName
+                        }
+                        closeReason.compareAndSet("session ended", "upstream error: " +
+                            (error.message ?: error.javaClass.simpleName))
                         throw error
-                    } ?: break
+                    } ?: run {
+                        closeReason.compareAndSet("session ended", when (upstream) {
+                            is WebSocketUpstream -> if (upstream.closedByPeer) {
+                                "upstream WebSocket CLOSE" + (upstream.closeCode?.let { " code=$it" } ?: "") +
+                                    if (upstream.closeReason.isNotEmpty()) " reason=${upstream.closeReason}" else ""
+                            } else "upstream EOF"
+                            else -> "upstream EOF"
+                        })
+                        break
+                    }
+                    downPackets.incrementAndGet()
+                    downBytes.addAndGet(data.size.toLong())
                     val plain = crypto.telegramDecrypt.update(data) ?: ByteArray(0)
                     val encrypted = crypto.clientEncrypt.update(plain) ?: ByteArray(0)
                     if (encrypted.isNotEmpty()) {
@@ -447,11 +479,10 @@ internal object LocalProxyEngine {
                 }
             } catch (error: Exception) {
                 if (running.get() && !finished.get()) {
-                    log("Upstream -> client bridge ended: " +
+                    log("Upstream -> client bridge error: " +
                         (error.message ?: error.javaClass.simpleName))
                 }
             } finally {
-                if (!finished.get() && running.get()) log("Upstream -> client stream closed")
                 finished.set(true)
                 runCatching { client.close() }
                 upstream.close()
@@ -465,25 +496,52 @@ internal object LocalProxyEngine {
             while (!finished.get() && running.get()) {
                 val count = clientInput.read(buffer)
                 if (count < 0) {
-                    wsSplitter?.flush()?.forEach(upstream::send)
+                    closeReason.compareAndSet("session ended", "client EOF")
+                    wsSplitter?.flush()?.forEach {
+                        upstream.send(it)
+                        upPackets.incrementAndGet()
+                        upBytes.addAndGet(it.size.toLong())
+                    }
                     break
                 }
                 val data = buffer.copyOf(count)
+                upPackets.incrementAndGet()
+                upBytes.addAndGet(count.toLong())
                 val plain = crypto.clientDecrypt.update(data) ?: ByteArray(0)
                 val encrypted = crypto.telegramEncrypt.update(plain) ?: ByteArray(0)
                 if (encrypted.isNotEmpty()) {
                     if (wsSplitter == null) {
                         upstream.send(encrypted)
+                        (upstream as? WebSocketUpstream)?.let { /* frame payload counted by send() */ }
                     } else {
                         wsSplitter.split(encrypted, plain).forEach(upstream::send)
                     }
                 }
+            }
+        } catch (error: Exception) {
+            closeReason.compareAndSet("session ended", "client error: " +
+                (error.message ?: error.javaClass.simpleName))
+            if (running.get() && !finished.get()) {
+                log("Client -> upstream bridge error: " +
+                    (error.message ?: error.javaClass.simpleName))
             }
         } finally {
             finished.set(true)
             runCatching { client.close() }
             upstream.close()
             runCatching { upstreamToClient.join(1000) }
+            val elapsed = System.currentTimeMillis() - startedAt
+            val ws = upstream as? WebSocketUpstream
+            log("Bridge closed (${closeReason.get()}): " +
+                "client→upstream ${upBytes.get()} bytes/${upPackets.get()} reads, " +
+                "upstream→client ${downBytes.get()} bytes/${downPackets.get()} frames, " +
+                "elapsed ${elapsed}ms" +
+                (ws?.let {
+                    ", WS sent=${it.sentBytes} received=${it.receivedBytes}" +
+                        (if (it.closeCode != null) ", closeCode=${it.closeCode}" else "") +
+                        (if (it.closeReason.isNotEmpty()) ", closeReason=${it.closeReason}" else "") +
+                        (if (it.upstreamFailure.isNotEmpty()) ", upstreamError=${it.upstreamFailure}" else "")
+                } ?: ""))
         }
     }
 
