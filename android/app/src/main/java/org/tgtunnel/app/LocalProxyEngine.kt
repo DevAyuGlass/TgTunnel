@@ -90,7 +90,16 @@ internal object LocalProxyEngine {
         }
     }
 
-    private class WebSocketUpstream(private val socket: SSLSocket, val splitFrames: Boolean) : Upstream {
+    private class WebSocketUpstream(
+        private val socket: SSLSocket,
+        val splitFrames: Boolean,
+        val cfProxyDomain: String? = null,
+        val cfProxyDc: Int? = null
+    ) : Upstream {
+        val connectedAtMs: Long = System.currentTimeMillis()
+        @Volatile var receivedBytes: Long = 0L
+        @Volatile var closedByPeer: Boolean = false
+        @Volatile var upstreamFailed: Boolean = false
         override fun socketForTracking(): Socket = socket
         private val input: InputStream = socket.getInputStream()
         private val output: OutputStream = socket.getOutputStream()
@@ -159,6 +168,7 @@ internal object LocalProxyEngine {
                         val closeReason = if (payload.size > 2) {
                             payload.copyOfRange(2, payload.size).toString(Charsets.UTF_8)
                         } else ""
+                        closedByPeer = true
                         log("Upstream WebSocket CLOSE: code=" + (closeCode?.toString() ?: "none") +
                             if (closeReason.isNotEmpty()) " reason=" + closeReason else "")
                         runCatching { sendFrame(0x8, payload.take(2).toByteArray()) }
@@ -170,6 +180,7 @@ internal object LocalProxyEngine {
                     }
                     0xA -> Unit
                     0x2, 0x0, 0x1 -> {
+                        receivedBytes += payload.size.toLong()
                         if (opcode != 0x0 && fragments.size() > 0) fragments.reset()
                         fragments.write(payload)
                         if (fragments.size() > 16 * 1024 * 1024) {
@@ -356,8 +367,31 @@ internal object LocalProxyEngine {
         } catch (error: Exception) {
             if (running.get()) log("Client session error: " + (error.message ?: error.javaClass.simpleName))
         } finally {
+            (upstream as? WebSocketUpstream)?.let(::recordCfProxyOutcome)
             upstream?.close()
             upstream?.let { activeUpstreams.remove(extractSocket(it)) }
+        }
+    }
+
+    private fun recordCfProxyOutcome(upstream: WebSocketUpstream) {
+        val domain = upstream.cfProxyDomain ?: return
+        val dc = upstream.cfProxyDc ?: return
+        val elapsed = System.currentTimeMillis() - upstream.connectedAtMs
+        if (upstream.receivedBytes > 0L || (elapsed >= 15_000L && !upstream.closedByPeer && !upstream.upstreamFailed)) {
+            cfProxyFailures.remove(domain)
+            cfProxyRetryAfter.remove(domain)
+            activeCfProxyDomains[dc] = domain
+            log("Cloudflare Proxy domain healthy: " + domain +
+                " (DC" + dc + ", received " + upstream.receivedBytes + " bytes)")
+        } else if (upstream.closedByPeer || upstream.upstreamFailed) {
+            val failures = (cfProxyFailures[domain] ?: 0) + 1
+            cfProxyFailures[domain] = failures
+            val backoffSeconds = minOf(300L, 5L shl minOf(failures - 1, 5))
+            cfProxyRetryAfter[domain] = System.currentTimeMillis() + backoffSeconds * 1000L
+            if (activeCfProxyDomains[dc] == domain) activeCfProxyDomains.remove(dc, domain)
+            log("Cloudflare Proxy domain marked unhealthy: " + domain +
+                " (DC" + dc + ", received " + upstream.receivedBytes +
+                " bytes); retry in " + backoffSeconds + "s")
         }
     }
 
@@ -382,6 +416,7 @@ internal object LocalProxyEngine {
                     }
                 }
             } catch (error: Exception) {
+                (upstream as? WebSocketUpstream)?.upstreamFailed = true
                 if (running.get() && !finished.get()) {
                     log("Upstream -> client bridge ended: " +
                         (error.message ?: error.javaClass.simpleName))
@@ -479,11 +514,9 @@ internal object LocalProxyEngine {
             for (baseDomain in candidates.ifEmpty { cfProxyDomains.shuffled() }) {
                 val host = "kws" + dcForDomain + "." + baseDomain
                 try {
-                    val upstream = connectWebSocket(host)
-                    activeCfProxyDomains[dcForDomain] = baseDomain
-                    cfProxyFailures.remove(baseDomain)
-                    cfProxyRetryAfter.remove(baseDomain)
-                    log("Connected to DC" + handshake.dcId + " through Cloudflare Proxy (" + baseDomain + ")")
+                    val upstream = connectWebSocket(host, cfProxyDomain = baseDomain, cfProxyDc = dcForDomain)
+                    log("WebSocket established to DC" + handshake.dcId +
+                        " through Cloudflare Proxy (" + baseDomain + "); waiting for tunnel health")
                     return upstream
                 } catch (error: Exception) {
                     val failures = (cfProxyFailures[baseDomain] ?: 0) + 1
@@ -518,7 +551,13 @@ internal object LocalProxyEngine {
         }
     }
 
-    private fun connectWebSocket(domain: String, requestPath: String = "/apiws", splitFrames: Boolean = true): WebSocketUpstream {
+    private fun connectWebSocket(
+        domain: String,
+        requestPath: String = "/apiws",
+        splitFrames: Boolean = true,
+        cfProxyDomain: String? = null,
+        cfProxyDc: Int? = null
+    ): WebSocketUpstream {
         val socket = connectTlsSocketIpv4First(domain)
         try {
             val keyBytes = ByteArray(16).also { random.nextBytes(it) }
@@ -565,7 +604,7 @@ internal object LocalProxyEngine {
                 throw SocketException("Invalid WebSocket accept header")
             }
             socket.soTimeout = 0
-            return WebSocketUpstream(socket, splitFrames)
+            return WebSocketUpstream(socket, splitFrames, cfProxyDomain, cfProxyDc)
         } catch (error: Exception) {
             runCatching { socket.close() }
             throw error
