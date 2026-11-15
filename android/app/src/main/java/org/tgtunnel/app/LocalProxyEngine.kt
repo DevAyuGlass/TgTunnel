@@ -417,7 +417,12 @@ internal object LocalProxyEngine {
         val upstreamToClient = Thread({
             try {
                 while (!finished.get() && running.get()) {
-                    val data = upstream.receive() ?: break
+                    val data = try {
+                        upstream.receive()
+                    } catch (error: Exception) {
+                        (upstream as? WebSocketUpstream)?.upstreamFailed = true
+                        throw error
+                    } ?: break
                     val plain = crypto.telegramDecrypt.update(data) ?: ByteArray(0)
                     val encrypted = crypto.clientEncrypt.update(plain) ?: ByteArray(0)
                     if (encrypted.isNotEmpty()) {
@@ -426,7 +431,6 @@ internal object LocalProxyEngine {
                     }
                 }
             } catch (error: Exception) {
-                (upstream as? WebSocketUpstream)?.upstreamFailed = true
                 if (running.get() && !finished.get()) {
                     log("Upstream -> client bridge ended: " +
                         (error.message ?: error.javaClass.simpleName))
