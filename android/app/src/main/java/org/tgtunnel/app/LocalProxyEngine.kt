@@ -104,6 +104,7 @@ internal object LocalProxyEngine {
     ) : Upstream {
         val connectedAtMs: Long = System.currentTimeMillis()
         @Volatile var receivedBytes: Long = 0L
+        @Volatile var firstReceivedAtMs: Long = 0L
         @Volatile var sentBytes: Long = 0L
         @Volatile var closedByPeer: Boolean = false
         @Volatile var closeCode: Int? = null
@@ -206,6 +207,7 @@ internal object LocalProxyEngine {
                             val result = fragments.toByteArray()
                             fragments.reset()
                             if (opcode == 0x1) continue
+                            if (firstReceivedAtMs == 0L) firstReceivedAtMs = System.currentTimeMillis()
                             return result
                         }
                     }
@@ -381,6 +383,9 @@ internal object LocalProxyEngine {
                 is TcpUpstream -> upstream.send(relayInit)
                 is WebSocketUpstream -> upstream.send(relayInit)
             }
+            log("MTProto relayInit sent: ${relayInit.size} bytes · DC${handshake.dcId}" +
+                (if (handshake.media) " media" else "") +
+                " · transport=" + transportName(handshake.transportTag))
             if (!running.get()) return
             log("Client connected · DC" + handshake.dcId +
                 (if (handshake.media) " media" else "") +
@@ -466,6 +471,8 @@ internal object LocalProxyEngine {
         val upPackets = AtomicLong(0L)
         val downPackets = AtomicLong(0L)
         val startedAt = System.currentTimeMillis()
+        var firstClientPayloadLogged = false
+        var splitterDiagnosticLogged = false
         val clientInput = client.getInputStream()
         val clientOutput = client.getOutputStream()
 
@@ -542,12 +549,22 @@ internal object LocalProxyEngine {
                 upBytes.addAndGet(count.toLong())
                 val plain = crypto.clientDecrypt.update(data) ?: ByteArray(0)
                 val encrypted = crypto.telegramEncrypt.update(plain) ?: ByteArray(0)
+                if (!firstClientPayloadLogged) {
+                    firstClientPayloadLogged = true
+                    val framing = wsSplitter?.diagnosticSnapshot()
+                        ?: ("transport=" + transportName(transportTag) + " frame splitting disabled")
+                    log("MTProto client payload decrypted: ciphertext=${data.size} bytes, " +
+                        "plaintext=${plain.size} bytes · $framing")
+                }
                 if (encrypted.isNotEmpty()) {
                     if (wsSplitter == null) {
                         upstream.send(encrypted)
-                        (upstream as? WebSocketUpstream)?.let { /* frame payload counted by send() */ }
                     } else {
                         wsSplitter.split(encrypted, plain).forEach(upstream::send)
+                        if (!splitterDiagnosticLogged) {
+                            splitterDiagnosticLogged = true
+                            log("MTProto transport framing: " + wsSplitter.diagnosticSnapshot())
+                        }
                     }
                 }
             }
@@ -573,7 +590,8 @@ internal object LocalProxyEngine {
                     ", WS sent=${it.sentBytes} received=${it.receivedBytes}" +
                         (if (it.closeCode != null) ", closeCode=${it.closeCode}" else "") +
                         (if (it.closeReason.isNotEmpty()) ", closeReason=${it.closeReason}" else "") +
-                        (if (it.upstreamFailure.isNotEmpty()) ", upstreamError=${it.upstreamFailure}" else "")
+                        (if (it.upstreamFailure.isNotEmpty()) ", upstreamError=${it.upstreamFailure}" else "") +
+                        (if (it.firstReceivedAtMs > 0L) ", firstResponse=${it.firstReceivedAtMs - it.connectedAtMs}ms" else ", firstResponse=none")
                 } ?: ""))
         }
     }
@@ -1139,6 +1157,13 @@ internal object LocalProxyEngine {
         val signed = if ((dcSigned and 0x8000) != 0) dcSigned - 0x10000 else dcSigned
         if (signed == 0 || signed == -32768) return null
         return Handshake(tag, kotlin.math.abs(signed), signed < 0, prekeyIv)
+    }
+
+    private fun transportName(tag: ByteArray): String = when {
+        tag.contentEquals(byteArrayOf(0xef.toByte(), 0xef.toByte(), 0xef.toByte(), 0xef.toByte())) -> "abridged"
+        tag.contentEquals(byteArrayOf(0xee.toByte(), 0xee.toByte(), 0xee.toByte(), 0xee.toByte())) -> "intermediate"
+        tag.contentEquals(byteArrayOf(0xdd.toByte(), 0xdd.toByte(), 0xdd.toByte(), 0xdd.toByte())) -> "padded-intermediate"
+        else -> "unknown"
     }
 
     private fun buildCryptoContext(handshake: Handshake, secret: ByteArray, relayInit: ByteArray): CryptoContext {
