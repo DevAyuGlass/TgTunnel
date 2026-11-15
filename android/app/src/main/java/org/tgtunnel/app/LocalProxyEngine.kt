@@ -665,12 +665,12 @@ internal object LocalProxyEngine {
             tls.sslParameters = parameters
             tls.startHandshake()
 
-            val request = "GET " + path + " HTTP/1.1\\r\\n" +
-                "Host: " + host + "\\r\\n" +
-                "Accept: application/dns-json\\r\\n" +
-                "Accept-Encoding: identity\\r\\n" +
-                "User-Agent: TGTunnel/1.0\\r\\n" +
-                "Connection: close\\r\\n\\r\\n"
+            val request = "GET " + path + " HTTP/1.1\r\n" +
+                "Host: " + host + "\r\n" +
+                "Accept: application/dns-json\r\n" +
+                "Accept-Encoding: identity\r\n" +
+                "User-Agent: TGTunnel/1.0\r\n" +
+                "Connection: close\r\n\r\n"
             tls.getOutputStream().apply {
                 write(request.toByteArray(Charsets.US_ASCII))
                 flush()
@@ -688,7 +688,7 @@ internal object LocalProxyEngine {
                     else if (value == 13) 1 else 0
             }
             if (matched != 4) throw SocketException("Invalid DoH HTTP headers")
-            val lines = headerBytes.toString("ISO-8859-1").split("\\r\\n")
+            val lines = headerBytes.toString("ISO-8859-1").split("\r\n")
             if (lines.firstOrNull()?.contains(" 200 ") != true) {
                 throw SocketException("DoH HTTP response: " + (lines.firstOrNull() ?: "empty"))
             }
