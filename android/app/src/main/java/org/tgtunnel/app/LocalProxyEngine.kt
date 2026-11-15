@@ -591,9 +591,9 @@ internal object LocalProxyEngine {
     }
 
     /**
-     * Resolve IPv4 addresses without raw UDP sockets. Some Android builds/networks
-     * deny app-created UDP/53 sockets (EPERM), while HTTPS remains available.
-     * Keep the original hostname on the TLS socket for SNI and certificate checks.
+     * Resolve IPv4 without depending on Android DNS for the resolver hostname.
+     * DoH bootstrap uses literal resolver IPs, while TLS SNI and certificate
+     * verification remain pinned to dns.google / cloudflare-dns.com.
      */
     private fun resolveIpv4(domain: String): List<InetAddress> {
         val now = System.currentTimeMillis()
@@ -611,36 +611,23 @@ internal object LocalProxyEngine {
             return result
         }
 
-        log("System DNS failed for " + domain + "; trying DNS-over-HTTPS")
-        val providers = listOf(
-            "https://dns.google/resolve?name=",
-            "https://cloudflare-dns.com/dns-query?name="
+        log("System DNS failed for " + domain + "; bootstrapping DNS-over-HTTPS by IP")
+        val resolvers = listOf(
+            Triple("dns.google", "8.8.8.8", "/resolve?name="),
+            Triple("dns.google", "8.8.4.4", "/resolve?name="),
+            Triple("cloudflare-dns.com", "1.1.1.1", "/dns-query?name="),
+            Triple("cloudflare-dns.com", "1.0.0.1", "/dns-query?name=")
         )
-        for (provider in providers) {
-            var connection: HttpURLConnection? = null
+        for ((host, ip, pathPrefix) in resolvers) {
             try {
-                val encodedName = URLEncoder.encode(domain, "UTF-8")
-                val url = URL(provider + encodedName + "&type=A")
-                connection = (url.openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    connectTimeout = 4500
-                    readTimeout = 4500
-                    useCaches = false
-                    setRequestProperty("Accept", "application/dns-json")
-                    setRequestProperty("User-Agent", "TGTunnel/1.0")
-                }
-                val status = connection.responseCode
-                if (status !in 200..299) {
-                    throw SocketException("DoH HTTP $status")
-                }
-                val body = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                val query = URLEncoder.encode(domain, "UTF-8") + "&type=A"
+                val body = queryDohJson(host, ip, pathPrefix + query)
                 val answers = JSONObject(body).optJSONArray("Answer") ?: continue
                 val addresses = buildList {
                     for (index in 0 until answers.length()) {
                         val answer = answers.optJSONObject(index) ?: continue
                         if (answer.optInt("type") != 1) continue
-                        val value = answer.optString("data")
-                        val octets = value.split('.')
+                        val octets = answer.optString("data").split('.')
                         if (octets.size != 4) continue
                         val bytes = octets.map { it.toIntOrNull() ?: -1 }
                         if (bytes.any { it !in 0..255 }) continue
@@ -649,17 +636,102 @@ internal object LocalProxyEngine {
                 }.distinctBy { it.hostAddress }
                 if (addresses.isNotEmpty()) {
                     dnsCache[domain] = (System.currentTimeMillis() + 60_000L) to addresses
-                    log("Resolved " + domain + " through DNS-over-HTTPS (" + URL(provider).host + ")")
+                    log("Resolved " + domain + " through bootstrapped DoH (" + host + " @ " + ip + ")")
                     return addresses
                 }
             } catch (error: Exception) {
-                log("DNS-over-HTTPS " + URL(provider).host + " failed for " + domain + ": " +
+                log("Bootstrapped DoH " + host + " (" + ip + ") failed for " + domain + ": " +
                     (error.message ?: error.javaClass.simpleName))
-            } finally {
-                connection?.disconnect()
             }
         }
-        throw UnknownHostException("Unable to resolve $domain using Android DNS or DNS-over-HTTPS")
+        throw UnknownHostException("Unable to resolve $domain using Android DNS or IP-bootstrapped DoH")
+    }
+
+    private fun queryDohJson(host: String, resolverIp: String, path: String): String {
+        val raw = Socket()
+        raw.connect(InetSocketAddress(resolverIp, 443), 5000)
+        raw.soTimeout = 6000
+        val tls = try {
+            (SSLSocketFactory.getDefault() as SSLSocketFactory)
+                .createSocket(raw, host, 443, true) as SSLSocket
+        } catch (error: Exception) {
+            runCatching { raw.close() }
+            throw error
+        }
+        try {
+            val parameters = tls.sslParameters
+            parameters.endpointIdentificationAlgorithm = "HTTPS"
+            parameters.serverNames = listOf(SNIHostName(host))
+            tls.sslParameters = parameters
+            tls.startHandshake()
+
+            val request = "GET " + path + " HTTP/1.1\\r\\n" +
+                "Host: " + host + "\\r\\n" +
+                "Accept: application/dns-json\\r\\n" +
+                "Accept-Encoding: identity\\r\\n" +
+                "User-Agent: TGTunnel/1.0\\r\\n" +
+                "Connection: close\\r\\n\\r\\n"
+            tls.getOutputStream().apply {
+                write(request.toByteArray(Charsets.US_ASCII))
+                flush()
+            }
+
+            val input = tls.getInputStream()
+            val headerBytes = ByteArrayOutputStream()
+            var matched = 0
+            val delimiter = byteArrayOf(13, 10, 13, 10)
+            while (headerBytes.size() < 16 * 1024 && matched < 4) {
+                val value = input.read()
+                if (value < 0) throw SocketException("DoH server closed before HTTP headers")
+                headerBytes.write(value)
+                matched = if (value == delimiter[matched].toInt()) matched + 1
+                    else if (value == 13) 1 else 0
+            }
+            if (matched != 4) throw SocketException("Invalid DoH HTTP headers")
+            val lines = headerBytes.toString("ISO-8859-1").split("\\r\\n")
+            if (lines.firstOrNull()?.contains(" 200 ") != true) {
+                throw SocketException("DoH HTTP response: " + (lines.firstOrNull() ?: "empty"))
+            }
+            val headers = lines.drop(1).mapNotNull { line ->
+                val separator = line.indexOf(':')
+                if (separator <= 0) null
+                else line.substring(0, separator).trim().lowercase() to line.substring(separator + 1).trim()
+            }.toMap()
+            val body = input.readBytes()
+            val decoded = if (headers["transfer-encoding"]?.contains("chunked", true) == true) {
+                decodeHttpChunks(body)
+            } else {
+                val length = headers["content-length"]?.toIntOrNull()
+                if (length != null && body.size < length) throw SocketException("Truncated DoH response")
+                if (length != null) body.copyOf(length) else body
+            }
+            return decoded.toString(Charsets.UTF_8)
+        } finally {
+            runCatching { tls.close() }
+        }
+    }
+
+    private fun decodeHttpChunks(data: ByteArray): ByteArray {
+        val output = ByteArrayOutputStream()
+        var offset = 0
+        while (offset < data.size) {
+            val lineEnd = (offset until data.size - 1).firstOrNull {
+                data[it] == 13.toByte() && data[it + 1] == 10.toByte()
+            } ?: throw SocketException("Malformed chunked DoH response")
+            val sizeText = data.copyOfRange(offset, lineEnd).toString(Charsets.US_ASCII)
+                .substringBefore(';').trim()
+            val size = sizeText.toIntOrNull(16) ?: throw SocketException("Invalid HTTP chunk size")
+            offset = lineEnd + 2
+            if (size == 0) break
+            if (size < 0 || offset + size + 2 > data.size) throw SocketException("Truncated HTTP chunk")
+            output.write(data, offset, size)
+            offset += size
+            if (data[offset] != 13.toByte() || data[offset + 1] != 10.toByte()) {
+                throw SocketException("Malformed HTTP chunk terminator")
+            }
+            offset += 2
+        }
+        return output.toByteArray()
     }
 
     private fun buildDnsAQuery(domain: String, id: Int): ByteArray {
