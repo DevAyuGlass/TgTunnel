@@ -458,14 +458,14 @@ internal object LocalProxyEngine {
                         closeReason.compareAndSet("session ended", "upstream error: " +
                             (error.message ?: error.javaClass.simpleName))
                         throw error
-                    } ?: run {
-                        closeReason.compareAndSet("session ended", when (upstream) {
-                            is WebSocketUpstream -> if (upstream.closedByPeer) {
-                                "upstream WebSocket CLOSE" + (upstream.closeCode?.let { " code=$it" } ?: "") +
-                                    if (upstream.closeReason.isNotEmpty()) " reason=${upstream.closeReason}" else ""
-                            } else "upstream EOF"
-                            else -> "upstream EOF"
-                        })
+                    }
+                    if (data == null) {
+                        val ws = upstream as? WebSocketUpstream
+                        val reason = if (ws?.closedByPeer == true) {
+                            "upstream WebSocket CLOSE" + (ws.closeCode?.let { " code=$it" } ?: "") +
+                                if (ws.closeReason.isNotEmpty()) " reason=${ws.closeReason}" else ""
+                        } else "upstream EOF"
+                        closeReason.compareAndSet("session ended", reason)
                         break
                     }
                     downPackets.incrementAndGet()
