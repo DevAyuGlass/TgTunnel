@@ -50,6 +50,11 @@ internal object LocalProxyEngine {
     @Volatile private var logCallback: ((String) -> Unit)? = null
     @Volatile private var workerDomains: List<String> = emptyList()
     @Volatile private var cloudflareProxyEnabled: Boolean = true
+    @Volatile private var dcRedirects: Map<Int, String> = mapOf(
+        2 to "149.154.167.220",
+        4 to "149.154.167.220"
+    )
+    @Volatile private var frontingFirst: Boolean = false
     @Volatile private var cfProxyDomains: List<String> = emptyList()
     @Volatile private var cfProxyRefreshThread: Thread? = null
     private val activeCfProxyDomains = ConcurrentHashMap<Int, String>()
@@ -263,13 +268,15 @@ internal object LocalProxyEngine {
 
     fun isRunning(): Boolean = running.get()
 
-    fun start(port: Int, secretHex: String, workerDomain: String, cfProxyEnabled: Boolean, onLog: (String) -> Unit): String {
+    fun start(port: Int, secretHex: String, workerDomain: String, cfProxyEnabled: Boolean, dcIpList: String, onLog: (String) -> Unit): String {
         if (port !in 1..65535) return "ERR:Port must be between 1 and 65535"
         val secret = parseSecret(secretHex) ?: return "ERR:Secret must contain exactly 32 hexadecimal characters"
         val configuredWorkers = parseWorkerDomains(workerDomain)
         if (workerDomain.isNotBlank() && configuredWorkers.isEmpty()) {
             return "ERR:Worker domain must be a hostname only (for example name.username.workers.dev)"
         }
+        val configuredDcRedirects = parseDcIpList(dcIpList)
+            ?: return "ERR:DC → IP must use comma-separated DC:IPv4 entries (for example 2:149.154.167.220)"
         synchronized(this) {
             if (running.get()) return "ERR:Proxy is already running"
             var server: ServerSocket? = null
@@ -281,6 +288,8 @@ internal object LocalProxyEngine {
                 logCallback = onLog
                 workerDomains = configuredWorkers
                 cloudflareProxyEnabled = cfProxyEnabled
+                dcRedirects = configuredDcRedirects
+                frontingFirst = false
                 cfProxyDomains = defaultCfProxyDomains
                 // Keep CF Proxy health learned from previous start/stop cycles.
                 tcpFailures.clear()
@@ -615,19 +624,33 @@ internal object LocalProxyEngine {
         } else {
             listOf("kws" + dcForDomain + ".web.telegram.org")
         }
+        val redirectIp = dcRedirects[dcForDomain]
         for (domain in domains) {
             if (!running.get()) return null
-            try {
-                val ws = connectWebSocket(domain)
-                if (!running.get()) {
-                    unregisterUpstreamSocket(extractSocket(ws))
-                    return null
-                }
-                log("Connected to " + domain + " over TLS WebSocket")
-                return ws
-            } catch (error: Exception) {
+            val modes = if (frontingFirst) listOf(true, false) else listOf(false, true)
+            for (fronted in modes) {
                 if (!running.get()) return null
-                log("WebSocket " + domain + " failed: " + (error.message ?: error.javaClass.simpleName))
+                try {
+                    val ws = connectWebSocket(
+                        domain,
+                        connectHost = redirectIp,
+                        tlsSni = if (fronted) "sprinthost.ru" else domain,
+                        verifyHostname = !fronted
+                    )
+                    if (!running.get()) {
+                        unregisterUpstreamSocket(extractSocket(ws))
+                        return null
+                    }
+                    frontingFirst = fronted
+                    log("Connected to " + domain + " over TLS WebSocket" +
+                        (redirectIp?.let { " via DC redirect $it" } ?: "") +
+                        " (fronting=$fronted)")
+                    return ws
+                } catch (error: Exception) {
+                    if (!running.get()) return null
+                    log("WebSocket " + domain + " (fronting=$fronted) failed: " +
+                        (error.message ?: error.javaClass.simpleName))
+                }
             }
         }
 
@@ -745,10 +768,13 @@ internal object LocalProxyEngine {
         requestPath: String = "/apiws",
         splitFrames: Boolean = true,
         cfProxyDomain: String? = null,
-        cfProxyDc: Int? = null
+        cfProxyDc: Int? = null,
+        connectHost: String? = null,
+        tlsSni: String? = null,
+        verifyHostname: Boolean = true
     ): WebSocketUpstream {
         if (!running.get()) throw SocketException("Proxy is stopped")
-        val socket = connectTlsSocketIpv4First(domain)
+        val socket = connectTlsSocketIpv4First(domain, connectHost, tlsSni ?: domain, verifyHostname)
         try {
             if (!running.get()) throw SocketException("Proxy stopped during TLS setup")
             val keyBytes = ByteArray(16).also { random.nextBytes(it) }
@@ -808,9 +834,18 @@ internal object LocalProxyEngine {
      * without a usable IPv6 route. If Android DNS fails, query public DNS over
      * UDP directly, while retaining the hostname for TLS SNI and verification.
      */
-    private fun connectTlsSocketIpv4First(domain: String): SSLSocket {
+    private fun connectTlsSocketIpv4First(
+        domain: String,
+        connectHost: String? = null,
+        tlsSni: String = domain,
+        verifyHostname: Boolean = true
+    ): SSLSocket {
         if (!running.get()) throw SocketException("Proxy is stopped")
-        val addresses = resolveIpv4(domain)
+        val addresses = if (connectHost != null) {
+            listOf(InetAddress.getByName(connectHost))
+        } else {
+            resolveIpv4(domain)
+        }
         if (!running.get()) throw SocketException("Proxy stopped during DNS resolution")
         var lastError: Exception? = null
         for (address in addresses) {
@@ -823,15 +858,15 @@ internal object LocalProxyEngine {
                 raw.connect(InetSocketAddress(address, 443), 7000)
                 if (!running.get()) throw SocketException("Proxy stopped during TCP connect")
                 ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory)
-                    .createSocket(raw, domain, 443, true) as SSLSocket
+                    .createSocket(raw, tlsSni, 443, true) as SSLSocket
                 if (!registerUpstreamSocket(ssl)) throw SocketException("Proxy stopped before TLS handshake")
                 // Register the TLS wrapper before dropping the raw socket so stop()
                 // can close either representation without an untracked interval.
                 activeUpstreams.remove(raw)
                 ssl.soTimeout = 12000
                 val parameters = ssl.sslParameters
-                parameters.endpointIdentificationAlgorithm = "HTTPS"
-                parameters.serverNames = listOf(SNIHostName(domain))
+                parameters.endpointIdentificationAlgorithm = if (verifyHostname) "HTTPS" else null
+                parameters.serverNames = listOf(SNIHostName(tlsSni))
                 ssl.sslParameters = parameters
                 ssl.startHandshake()
                 if (!running.get()) throw SocketException("Proxy stopped during TLS handshake")
@@ -1145,6 +1180,24 @@ internal object LocalProxyEngine {
                 !hostnamePattern.matches(it) || "." !in it || ".." in it || it.startsWith(".")
             }) return emptyList()
         return hosts
+    }
+
+    private fun parseDcIpList(value: String): Map<Int, String>? {
+        if (value.isBlank()) return emptyMap()
+        val result = linkedMapOf<Int, String>()
+        for (entry in value.replace(';', ',').split(',')) {
+            val parts = entry.trim().split(':', limit = 2)
+            if (parts.size != 2) return null
+            val dc = parts[0].trim().toIntOrNull() ?: return null
+            val ip = parts[1].trim()
+            if (dc !in 1..5 && dc != 203) return null
+            val octets = ip.split('.')
+            if (octets.size != 4 || octets.any { it.toIntOrNull()?.let { n -> n in 0..255 } != true }) {
+                return null
+            }
+            if (result.put(dc, ip) != null) return null
+        }
+        return result
     }
 
     private fun decodeHandshake(encrypted: ByteArray, secret: ByteArray): Handshake? {

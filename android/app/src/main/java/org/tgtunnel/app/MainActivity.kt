@@ -80,6 +80,8 @@ private const val KEY_VERBOSE = "verbose_logs"
 private const val KEY_SECRET = "mtproto_secret"
 private const val KEY_CF_WORKER = "cloudflare_worker_domain"
 private const val KEY_CF_PROXY = "cloudflare_proxy_fallback"
+private const val KEY_DC_IP = "dc_ip_redirects"
+private const val DEFAULT_DC_IP = "2:149.154.167.220,4:149.154.167.220"
 
 private val logIds = AtomicLong(0)
 
@@ -92,7 +94,8 @@ private data class AppSettings(
     val autostart: Boolean = false,
     val verboseLogs: Boolean = false,
     val workerDomain: String = "",
-    val cfProxyFallback: Boolean = true
+    val cfProxyFallback: Boolean = true,
+    val dcIp: String = DEFAULT_DC_IP
 )
 
 private data class LogEntry(
@@ -125,7 +128,8 @@ private fun TgTunnelApp() {
                 autostart = preferences.getBoolean(KEY_AUTOSTART, false),
                 verboseLogs = preferences.getBoolean(KEY_VERBOSE, false),
                 workerDomain = preferences.getString(KEY_CF_WORKER, "") ?: "",
-                cfProxyFallback = preferences.getBoolean(KEY_CF_PROXY, true)
+                cfProxyFallback = preferences.getBoolean(KEY_CF_PROXY, true),
+                dcIp = preferences.getString(KEY_DC_IP, DEFAULT_DC_IP) ?: DEFAULT_DC_IP
             )
         )
     }
@@ -151,6 +155,7 @@ private fun TgTunnelApp() {
             .putBoolean(KEY_VERBOSE, next.verboseLogs)
             .putString(KEY_CF_WORKER, next.workerDomain)
             .putBoolean(KEY_CF_PROXY, next.cfProxyFallback)
+            .putString(KEY_DC_IP, next.dcIp)
             .apply()
     }
 
@@ -167,7 +172,7 @@ private fun TgTunnelApp() {
             val port = settings.port.toIntOrNull()
             if (port != null && port in 1..65535) {
                 val result = withContext(Dispatchers.IO) {
-                    NativeBridge.start(port, settings.secret, settings.workerDomain, settings.cfProxyFallback) { message ->
+                    NativeBridge.start(port, settings.secret, settings.workerDomain, settings.cfProxyFallback, settings.dcIp) { message ->
                         android.os.Handler(android.os.Looper.getMainLooper()).post { addLog(message) }
                     }
                 }
@@ -205,7 +210,7 @@ private fun TgTunnelApp() {
                                 connectionBusy = true
                                 scope.launch {
                                     val result = withContext(Dispatchers.IO) {
-                                        NativeBridge.start(port, settings.secret, settings.workerDomain, settings.cfProxyFallback) { message ->
+                                        NativeBridge.start(port, settings.secret, settings.workerDomain, settings.cfProxyFallback, settings.dcIp) { message ->
                                             android.os.Handler(android.os.Looper.getMainLooper()).post { addLog(message) }
                                         }
                                     }
@@ -503,7 +508,7 @@ private fun EngineCard() {
     ) {
         Column(modifier = Modifier.padding(17.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             EngineRow("Платформа", "Android only")
-            EngineRow("Язык движка", "C++")
+            EngineRow("Язык движка", "Kotlin / JVM")
             EngineRow("Интерфейс", "Kotlin + Compose")
             EngineRow("Транспорт", "Telegram WS + CF Worker + CF Proxy + TCP", ConnectedGreen)
         }
@@ -591,6 +596,16 @@ private fun SettingsScreen(
                     supportingText = { Text("Допустимый диапазон: 1–65535") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                )
+                OutlinedTextField(
+                    value = settings.dcIp,
+                    onValueChange = { onSettingsChanged(settings.copy(dcIp = it)) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("DC → IP") },
+                    placeholder = { Text(DEFAULT_DC_IP) },
+                    supportingText = { Text("Перенаправление прямого WebSocket-подключения. Формат DC:IPv4, несколько записей через запятую.") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri)
                 )
             }
         }
