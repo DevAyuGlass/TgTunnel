@@ -183,6 +183,9 @@ internal object LocalProxyEngine {
                     }
                     0xA -> Unit
                     0x2, 0x0, 0x1 -> {
+                        // Only binary WebSocket messages carry the MTProto stream.
+                        // Text/control traffic must never count as tunnel health.
+                        if (opcode == 0x1) continue
                         receivedBytes += payload.size.toLong()
                         if (opcode != 0x0 && fragments.size() > 0) fragments.reset()
                         fragments.write(payload)
@@ -376,7 +379,11 @@ internal object LocalProxyEngine {
         } catch (error: Exception) {
             if (running.get()) log("Client session error: " + (error.message ?: error.javaClass.simpleName))
         } finally {
-            (upstream as? WebSocketUpstream)?.let(::recordCfProxyOutcome)
+            // A user-initiated stop closes active sockets. Do not treat that as
+            // evidence that the selected Cloudflare domain is unhealthy.
+            if (running.get()) {
+                (upstream as? WebSocketUpstream)?.let(::recordCfProxyOutcome)
+            }
             upstream?.close()
             upstream?.let { activeUpstreams.remove(extractSocket(it)) }
         }
@@ -386,8 +393,12 @@ internal object LocalProxyEngine {
         val domain = upstream.cfProxyDomain ?: return
         val dc = upstream.cfProxyDc ?: return
         val elapsed = System.currentTimeMillis() - upstream.connectedAtMs
-        val closedTooEarly = (upstream.closedByPeer || upstream.upstreamFailed) && elapsed < 15_000L
-        if (closedTooEarly) {
+        val failedEarly = (upstream.closedByPeer || upstream.upstreamFailed) &&
+            elapsed < 15_000L && upstream.receivedBytes < 64L
+        val hasMeaningfulResponse = upstream.receivedBytes >= 64L
+        val healthySession = !upstream.closedByPeer && !upstream.upstreamFailed &&
+            elapsed >= 5_000L && hasMeaningfulResponse
+        if (failedEarly) {
             val failures = (cfProxyFailures[domain] ?: 0) + 1
             cfProxyFailures[domain] = failures
             val backoffSeconds = minOf(300L, 5L shl minOf(failures - 1, 5))
@@ -396,12 +407,16 @@ internal object LocalProxyEngine {
             log("Cloudflare Proxy domain marked unhealthy: " + domain +
                 " (DC" + dc + ", age " + elapsed + "ms, received " +
                 upstream.receivedBytes + " bytes); retry in " + backoffSeconds + "s")
-        } else if (upstream.receivedBytes > 0L || elapsed >= 15_000L) {
+        } else if (healthySession) {
             cfProxyFailures.remove(domain)
             cfProxyRetryAfter.remove(domain)
             activeCfProxyDomains[dc] = domain
             log("Cloudflare Proxy domain healthy: " + domain +
                 " (DC" + dc + ", age " + elapsed + "ms, received " + upstream.receivedBytes + " bytes)")
+        } else {
+            log("Cloudflare Proxy domain health inconclusive: " + domain +
+                " (DC" + dc + ", age " + elapsed + "ms, received " +
+                upstream.receivedBytes + " bytes)")
         }
     }
 
