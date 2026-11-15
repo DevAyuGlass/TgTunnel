@@ -90,7 +90,7 @@ internal object LocalProxyEngine {
         }
     }
 
-    private class WebSocketUpstream(private val socket: SSLSocket) : Upstream {
+    private class WebSocketUpstream(private val socket: SSLSocket, val splitFrames: Boolean) : Upstream {
         override fun socketForTracking(): Socket = socket
         private val input: InputStream = socket.getInputStream()
         private val output: OutputStream = socket.getOutputStream()
@@ -344,7 +344,7 @@ internal object LocalProxyEngine {
             }
             activeUpstreams.add(extractSocket(upstream))
             log("Client connected · DC" + handshake.dcId + if (handshake.media) " media" else "")
-            bridge(client, upstream, crypto)
+            bridge(client, upstream, crypto, handshake.transportTag)
         } catch (error: Exception) {
             if (running.get()) log("Client session error: " + (error.message ?: error.javaClass.simpleName))
         } finally {
@@ -355,7 +355,10 @@ internal object LocalProxyEngine {
 
     private fun extractSocket(upstream: Upstream): Socket = upstream.socketForTracking()
 
-    private fun bridge(client: Socket, upstream: Upstream, crypto: CryptoContext) {
+    private fun bridge(client: Socket, upstream: Upstream, crypto: CryptoContext, transportTag: ByteArray) {
+        val wsSplitter = (upstream as? WebSocketUpstream)
+            ?.takeIf { it.splitFrames }
+            ?.let { MtprotoMsgSplitter(transportTag) }
         val finished = AtomicBoolean(false)
         val clientInput = client.getInputStream()
         val clientOutput = client.getOutputStream()
@@ -385,11 +388,20 @@ internal object LocalProxyEngine {
             val buffer = ByteArray(65536)
             while (!finished.get() && running.get()) {
                 val count = clientInput.read(buffer)
-                if (count < 0) break
+                if (count < 0) {
+                    wsSplitter?.flush()?.forEach(upstream::send)
+                    break
+                }
                 val data = buffer.copyOf(count)
                 val plain = crypto.clientDecrypt.update(data) ?: ByteArray(0)
                 val encrypted = crypto.telegramEncrypt.update(plain) ?: ByteArray(0)
-                if (encrypted.isNotEmpty()) upstream.send(encrypted)
+                if (encrypted.isNotEmpty()) {
+                    if (wsSplitter == null) {
+                        upstream.send(encrypted)
+                    } else {
+                        wsSplitter.split(encrypted, plain).forEach(upstream::send)
+                    }
+                }
             }
         } finally {
             finished.set(true)
@@ -427,7 +439,7 @@ internal object LocalProxyEngine {
                     try {
                         val path = "/apiws?dst=" + URLEncoder.encode(destination, "UTF-8") +
                             "&dc=" + dcForDomain
-                        val upstream = connectWebSocket(worker, path)
+                        val upstream = connectWebSocket(worker, path, splitFrames = false)
                         log("Connected to " + destination + " through Cloudflare Worker " + worker)
                         return upstream
                     } catch (error: Exception) {
@@ -494,7 +506,7 @@ internal object LocalProxyEngine {
         }
     }
 
-    private fun connectWebSocket(domain: String, requestPath: String = "/apiws"): WebSocketUpstream {
+    private fun connectWebSocket(domain: String, requestPath: String = "/apiws", splitFrames: Boolean = true): WebSocketUpstream {
         val socket = connectTlsSocketIpv4First(domain)
         try {
             val keyBytes = ByteArray(16).also { random.nextBytes(it) }
@@ -541,7 +553,7 @@ internal object LocalProxyEngine {
                 throw SocketException("Invalid WebSocket accept header")
             }
             socket.soTimeout = 0
-            return WebSocketUpstream(socket)
+            return WebSocketUpstream(socket, splitFrames)
         } catch (error: Exception) {
             runCatching { socket.close() }
             throw error
