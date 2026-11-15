@@ -1,5 +1,7 @@
 package org.tgtunnel.app
 
+import java.io.ByteArrayOutputStream
+
 /**
  * Reassembles the decrypted MTProto byte stream and emits one transport packet
  * per WebSocket binary message, matching Flowseal's MsgSplitter behaviour.
