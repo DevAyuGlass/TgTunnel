@@ -153,6 +153,14 @@ internal object LocalProxyEngine {
                 }
                 when (opcode) {
                     0x8 -> {
+                        val closeCode = if (payload.size >= 2) {
+                            ((payload[0].toInt() and 0xff) shl 8) or (payload[1].toInt() and 0xff)
+                        } else null
+                        val closeReason = if (payload.size > 2) {
+                            payload.copyOfRange(2, payload.size).toString(Charsets.UTF_8)
+                        } else ""
+                        log("Upstream WebSocket CLOSE: code=" + (closeCode?.toString() ?: "none") +
+                            if (closeReason.isNotEmpty()) " reason=" + closeReason else "")
                         runCatching { sendFrame(0x8, payload.take(2).toByteArray()) }
                         closed.set(true)
                         return null
@@ -373,9 +381,13 @@ internal object LocalProxyEngine {
                         clientOutput.flush()
                     }
                 }
-            } catch (_: Exception) {
-                // Closing either side ends the session.
+            } catch (error: Exception) {
+                if (running.get() && !finished.get()) {
+                    log("Upstream -> client bridge ended: " +
+                        (error.message ?: error.javaClass.simpleName))
+                }
             } finally {
+                if (!finished.get() && running.get()) log("Upstream -> client stream closed")
                 finished.set(true)
                 runCatching { client.close() }
                 upstream.close()
