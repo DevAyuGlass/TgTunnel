@@ -280,9 +280,7 @@ internal object LocalProxyEngine {
                 workerDomains = configuredWorkers
                 cloudflareProxyEnabled = cfProxyEnabled
                 cfProxyDomains = defaultCfProxyDomains
-                activeCfProxyDomains.clear()
-                cfProxyFailures.clear()
-                cfProxyRetryAfter.clear()
+                // Keep CF Proxy health learned from previous start/stop cycles.
                 tcpFailures.clear()
                 tcpRetryAfter.clear()
                 tcpConnecting.clear()
@@ -314,9 +312,7 @@ internal object LocalProxyEngine {
             cfProxyRefreshThread?.interrupt()
             cfProxyRefreshThread = null
             cfProxyDomains = emptyList()
-            activeCfProxyDomains.clear()
-            cfProxyFailures.clear()
-            cfProxyRetryAfter.clear()
+            // Preserve known-good routes and per-domain backoff across manual stops.
             tcpFailures.clear()
             tcpRetryAfter.clear()
             tcpConnecting.clear()
@@ -1078,7 +1074,8 @@ internal object LocalProxyEngine {
             }
             if (fetched.size >= 3 && running.get() && cloudflareProxyEnabled) {
                 cfProxyDomains = fetched
-                activeCfProxyDomains.clear()
+                // Retain healthy DC routes while their domains remain in the refreshed pool.
+                activeCfProxyDomains.entries.removeIf { entry -> !fetched.contains(entry.value) }
                 log("Cloudflare Proxy domain pool refreshed: " + fetched.size + " domains")
             } else {
                 log("Cloudflare Proxy refresh returned too few valid domains; keeping current pool")
