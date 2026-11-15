@@ -52,6 +52,9 @@ internal object LocalProxyEngine {
     private val activeCfProxyDomains = ConcurrentHashMap<Int, String>()
     private val cfProxyFailures = ConcurrentHashMap<String, Int>()
     private val cfProxyRetryAfter = ConcurrentHashMap<String, Long>()
+    private val tcpFailures = ConcurrentHashMap<String, Int>()
+    private val tcpRetryAfter = ConcurrentHashMap<String, Long>()
+    private val tcpConnecting = ConcurrentHashMap.newKeySet<String>()
     private val dnsCache = ConcurrentHashMap<String, Pair<Long, List<InetAddress>>>()
 
     // Encoded list and decoding are kept compatible with Flowseal's upstream
@@ -267,6 +270,9 @@ internal object LocalProxyEngine {
                 activeCfProxyDomains.clear()
                 cfProxyFailures.clear()
                 cfProxyRetryAfter.clear()
+                tcpFailures.clear()
+                tcpRetryAfter.clear()
+                tcpConnecting.clear()
                 listener = boundServer
                 running.set(true)
                 acceptThread = Thread({ acceptLoop(boundServer, secret) }, "tgtunnel-accept").apply {
@@ -298,6 +304,9 @@ internal object LocalProxyEngine {
             activeCfProxyDomains.clear()
             cfProxyFailures.clear()
             cfProxyRetryAfter.clear()
+            tcpFailures.clear()
+            tcpRetryAfter.clear()
+            tcpConnecting.clear()
             dnsCache.clear()
             activeClients.toList().forEach { runCatching { it.close() } }
             activeUpstreams.toList().forEach { runCatching { it.close() } }
@@ -539,16 +548,37 @@ internal object LocalProxyEngine {
             5 -> "149.154.171.5"
             else -> return null
         }
-        return try {
-            val socket = Socket()
+        val endpoint = "$ip:443"
+        val retryAt = tcpRetryAfter[endpoint] ?: 0L
+        if (retryAt > System.currentTimeMillis()) {
+            log("TCP fallback to " + endpoint + " is cooling down for " +
+                ((retryAt - System.currentTimeMillis() + 999L) / 1000L) + "s")
+            return null
+        }
+        if (!tcpConnecting.add(endpoint)) {
+            log("TCP fallback to " + endpoint + " skipped: connection already in progress")
+            return null
+        }
+        val socket = Socket()
+        try {
             socket.connect(InetSocketAddress(ip, 443), 10000)
             socket.tcpNoDelay = true
+            tcpFailures.remove(endpoint)
+            tcpRetryAfter.remove(endpoint)
             activeUpstreams.add(socket)
             log("Using direct TCP fallback to DC" + handshake.dcId)
             TcpUpstream(socket)
         } catch (error: Exception) {
-            log("TCP fallback failed: " + (error.message ?: error.javaClass.simpleName))
+            runCatching { socket.close() }
+            val failures = (tcpFailures[endpoint] ?: 0) + 1
+            tcpFailures[endpoint] = failures
+            val backoffSeconds = minOf(3600L, 30L shl minOf(failures - 1, 7))
+            tcpRetryAfter[endpoint] = System.currentTimeMillis() + backoffSeconds * 1000L
+            log("TCP fallback to " + endpoint + " failed (retry in " + backoffSeconds + "s): " +
+                (error.message ?: error.javaClass.simpleName))
             null
+        } finally {
+            tcpConnecting.remove(endpoint)
         }
     }
 
