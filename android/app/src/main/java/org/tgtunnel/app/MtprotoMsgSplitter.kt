@@ -19,6 +19,7 @@ internal class MtprotoMsgSplitter(transportTag: ByteArray) {
     private val cipherBuffer = ByteArrayOutputStream()
     private val plainBuffer = ByteArrayOutputStream()
     private var disabled = protocol == UNKNOWN
+    private var firstFrameDiagnostic: String? = null
 
     @Synchronized
     fun split(ciphertext: ByteArray, plaintext: ByteArray): List<ByteArray> {
@@ -34,13 +35,26 @@ internal class MtprotoMsgSplitter(transportTag: ByteArray) {
         var offset = 0
 
         while (offset < plain.size) {
-            val packetLength = nextPacketLength(plain, offset, plain.size - offset) ?: break
-            if (packetLength <= 0 || packetLength > plain.size - offset) {
+            val available = plain.size - offset
+            val packetLength = nextPacketLength(plain, offset, available)
+            if (packetLength == null) {
+                if (firstFrameDiagnostic == null || firstFrameDiagnostic!!.startsWith("pending")) {
+                    firstFrameDiagnostic = describeFrame(plain, offset, available, complete = false)
+                }
+                break
+            }
+            if (packetLength <= 0 || packetLength > available) {
+                if (firstFrameDiagnostic == null || firstFrameDiagnostic!!.startsWith("pending")) {
+                    firstFrameDiagnostic = describeFrame(plain, offset, available, complete = false) + "; invalid framing"
+                }
                 disabled = true
                 if (offset == 0) packets += cipher
                 else packets += cipher.copyOfRange(offset, cipher.size)
                 offset = cipher.size
                 break
+            }
+            if (firstFrameDiagnostic == null || firstFrameDiagnostic!!.startsWith("pending")) {
+                firstFrameDiagnostic = describeFrame(plain, offset, available, complete = true)
             }
             packets += cipher.copyOfRange(offset, offset + packetLength)
             offset += packetLength
@@ -55,6 +69,49 @@ internal class MtprotoMsgSplitter(transportTag: ByteArray) {
             }
         }
         return packets
+    }
+
+    @Synchronized
+    fun diagnosticSnapshot(): String {
+        val buffered = cipherBuffer.size()
+        val state = firstFrameDiagnostic ?: if (disabled) "splitter disabled" else "first frame not parsed"
+        return "transport=${protocolName()} $state buffered=$buffered disabled=$disabled"
+    }
+
+    private fun protocolName(): String = when (protocol) {
+        ABRIDGED -> "abridged"
+        INTERMEDIATE -> "intermediate"
+        PADDED_INTERMEDIATE -> "padded-intermediate"
+        else -> "unknown"
+    }
+
+    private fun describeFrame(data: ByteArray, offset: Int, available: Int, complete: Boolean): String {
+        if (available <= 0) return "pending: no plaintext bytes"
+        return when (protocol) {
+            ABRIDGED -> {
+                val first = data[offset].toInt() and 0xff
+                val header = if (first == 0x7f || first == 0xff) 4 else 1
+                if (available < header) return "pending: abridged header bytes=$available/$header"
+                val words = if (header == 4) {
+                    (data[offset + 1].toInt() and 0xff) or
+                        ((data[offset + 2].toInt() and 0xff) shl 8) or
+                        ((data[offset + 3].toInt() and 0xff) shl 16)
+                } else first and 0x7f
+                val payload = words.toLong() * 4L
+                "${if (complete) "frame" else "pending"}: abridged header=$header words=$words payload=$payload total=${header + payload} available=$available"
+            }
+            INTERMEDIATE, PADDED_INTERMEDIATE -> {
+                if (available < 4) return "pending: ${protocolName()} header bytes=$available/4"
+                val raw = (data[offset].toLong() and 0xffL) or
+                    ((data[offset + 1].toLong() and 0xffL) shl 8) or
+                    ((data[offset + 2].toLong() and 0xffL) shl 16) or
+                    ((data[offset + 3].toLong() and 0xffL) shl 24)
+                val payload = raw and 0x7fffffffL
+                val quickAck = (raw and 0x80000000L) != 0L
+                "${if (complete) "frame" else "pending"}: ${protocolName()} payload=$payload total=${4L + payload} quickAck=$quickAck available=$available"
+            }
+            else -> "unknown transport framing"
+        }
     }
 
     @Synchronized
