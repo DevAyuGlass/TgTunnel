@@ -549,22 +549,28 @@ internal object LocalProxyEngine {
                 upBytes.addAndGet(count.toLong())
                 val plain = crypto.clientDecrypt.update(data) ?: ByteArray(0)
                 val encrypted = crypto.telegramEncrypt.update(plain) ?: ByteArray(0)
-                if (!firstClientPayloadLogged) {
-                    firstClientPayloadLogged = true
-                    val framing = wsSplitter?.diagnosticSnapshot()
-                        ?: ("transport=" + transportName(transportTag) + " frame splitting disabled")
-                    log("MTProto client payload decrypted: ciphertext=${data.size} bytes, " +
-                        "plaintext=${plain.size} bytes · $framing")
-                }
                 if (encrypted.isNotEmpty()) {
                     if (wsSplitter == null) {
+                        if (!firstClientPayloadLogged) {
+                            firstClientPayloadLogged = true
+                            log("MTProto client payload decrypted: ciphertext=${data.size} bytes, " +
+                                "plaintext=${plain.size} bytes · transport=" + transportName(transportTag) +
+                                " · frame splitting disabled")
+                        }
                         upstream.send(encrypted)
                     } else {
-                        wsSplitter.split(encrypted, plain).forEach(upstream::send)
+                        val frames = wsSplitter.split(encrypted, plain)
+                        if (!firstClientPayloadLogged) {
+                            firstClientPayloadLogged = true
+                            log("MTProto client payload decrypted: ciphertext=${data.size} bytes, " +
+                                "plaintext=${plain.size} bytes")
+                        }
                         if (!splitterDiagnosticLogged) {
                             splitterDiagnosticLogged = true
-                            log("MTProto transport framing: " + wsSplitter.diagnosticSnapshot())
+                            log("MTProto transport framing: " + wsSplitter.diagnosticSnapshot() +
+                                " · emittedFrames=" + frames.size)
                         }
+                        frames.forEach(upstream::send)
                     }
                 }
             }
@@ -582,6 +588,7 @@ internal object LocalProxyEngine {
             runCatching { upstreamToClient.join(1000) }
             val elapsed = System.currentTimeMillis() - startedAt
             val ws = upstream as? WebSocketUpstream
+            wsSplitter?.let { log("MTProto framing at close: " + it.diagnosticSnapshot()) }
             log("Bridge closed (${closeReason.get()}): " +
                 "client→upstream ${upBytes.get()} bytes/${upPackets.get()} reads, " +
                 "upstream→client ${downBytes.get()} bytes/${downPackets.get()} frames, " +
