@@ -41,6 +41,7 @@ internal object LocalProxyEngine {
     private const val WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     private val random = SecureRandom()
     private val activeClients = ConcurrentHashMap.newKeySet<Socket>()
+    // Includes sockets during TCP connect, TLS handshake, and HTTP Upgrade.
     private val activeUpstreams = ConcurrentHashMap.newKeySet<Socket>()
     private val running = AtomicBoolean(false)
 
@@ -366,6 +367,7 @@ internal object LocalProxyEngine {
         try {
             client.soTimeout = 10000
             val header = readExact(client.getInputStream(), HANDSHAKE_SIZE)
+            if (!running.get()) return
             val handshake = decodeHandshake(header, secret) ?: run {
                 log("Rejected client: invalid MTProto handshake or secret")
                 return
@@ -375,15 +377,18 @@ internal object LocalProxyEngine {
             val crypto = buildCryptoContext(handshake, secret, relayInit)
             upstream = connectUpstream(handshake)
             if (upstream == null) {
-                log("DC" + handshake.dcId + " upstream connection failed")
+                if (running.get()) log("DC" + handshake.dcId + " upstream connection failed")
                 return
             }
+            if (!running.get()) return
             when (upstream) {
                 is TcpUpstream -> upstream.send(relayInit)
                 is WebSocketUpstream -> upstream.send(relayInit)
             }
-            activeUpstreams.add(extractSocket(upstream))
-            log("Client connected · DC" + handshake.dcId + if (handshake.media) " media" else "")
+            if (!running.get()) return
+            log("Client connected · DC" + handshake.dcId +
+                (if (handshake.media) " media" else "") +
+                " · local client " + (client.remoteSocketAddress?.toString() ?: "unknown"))
             bridge(client, upstream, crypto, handshake.transportTag)
         } catch (error: Exception) {
             if (running.get()) log("Client session error: " + (error.message ?: error.javaClass.simpleName))
@@ -430,6 +435,29 @@ internal object LocalProxyEngine {
     }
 
     private fun extractSocket(upstream: Upstream): Socket = upstream.socketForTracking()
+
+    /**
+     * Register before blocking network operations. The second running check closes
+     * the race where stop() snapshots activeUpstreams between the first check and add().
+     */
+    private fun registerUpstreamSocket(socket: Socket): Boolean {
+        if (!running.get()) {
+            runCatching { socket.close() }
+            return false
+        }
+        activeUpstreams.add(socket)
+        if (!running.get()) {
+            activeUpstreams.remove(socket)
+            runCatching { socket.close() }
+            return false
+        }
+        return true
+    }
+
+    private fun unregisterUpstreamSocket(socket: Socket) {
+        activeUpstreams.remove(socket)
+        runCatching { socket.close() }
+    }
 
     private fun bridge(client: Socket, upstream: Upstream, crypto: CryptoContext, transportTag: ByteArray) {
         val wsSplitter = (upstream as? WebSocketUpstream)
@@ -502,7 +530,10 @@ internal object LocalProxyEngine {
             while (!finished.get() && running.get()) {
                 val count = clientInput.read(buffer)
                 if (count < 0) {
-                    closeReason.compareAndSet("session ended", "client EOF")
+                    closeReason.compareAndSet(
+                        "session ended",
+                        "client EOF from " + (client.remoteSocketAddress?.toString() ?: "unknown")
+                    )
                     wsSplitter?.flush()?.forEach {
                         upstream.send(it)
                         upPackets.incrementAndGet()
@@ -552,6 +583,7 @@ internal object LocalProxyEngine {
     }
 
     private fun connectUpstream(handshake: Handshake): Upstream? {
+        if (!running.get()) return null
         val dcForDomain = if (handshake.dcId == 203) 2 else handshake.dcId
         if (dcForDomain !in 1..5) {
             log("Unsupported Telegram DC: " + handshake.dcId)
@@ -563,11 +595,17 @@ internal object LocalProxyEngine {
             listOf("kws" + dcForDomain + ".web.telegram.org")
         }
         for (domain in domains) {
+            if (!running.get()) return null
             try {
                 val ws = connectWebSocket(domain)
+                if (!running.get()) {
+                    unregisterUpstreamSocket(extractSocket(ws))
+                    return null
+                }
                 log("Connected to " + domain + " over TLS WebSocket")
                 return ws
             } catch (error: Exception) {
+                if (!running.get()) return null
                 log("WebSocket " + domain + " failed: " + (error.message ?: error.javaClass.simpleName))
             }
         }
@@ -575,14 +613,21 @@ internal object LocalProxyEngine {
         val workers = workerDomains
         if (workers.isNotEmpty()) {
             for (worker in workers) {
+                if (!running.get()) return null
                 for (destination in domains) {
+                    if (!running.get()) return null
                     try {
                         val path = "/apiws?dst=" + URLEncoder.encode(destination, "UTF-8") +
                             "&dc=" + dcForDomain
                         val upstream = connectWebSocket(worker, path, splitFrames = false)
+                        if (!running.get()) {
+                            unregisterUpstreamSocket(extractSocket(upstream))
+                            return null
+                        }
                         log("Connected to " + destination + " through Cloudflare Worker " + worker)
                         return upstream
                     } catch (error: Exception) {
+                        if (!running.get()) return null
                         log("Cloudflare Worker " + worker + " for " + destination + " failed: " +
                             (error.message ?: error.javaClass.simpleName))
                     }
@@ -605,13 +650,19 @@ internal object LocalProxyEngine {
                 log("Cloudflare Proxy pool is cooling down; retrying with the full pool")
             }
             for (baseDomain in candidates.ifEmpty { cfProxyDomains.shuffled() }) {
+                if (!running.get()) return null
                 val host = "kws" + dcForDomain + "." + baseDomain
                 try {
                     val upstream = connectWebSocket(host, cfProxyDomain = baseDomain, cfProxyDc = dcForDomain)
+                    if (!running.get()) {
+                        unregisterUpstreamSocket(extractSocket(upstream))
+                        return null
+                    }
                     log("WebSocket established to DC" + handshake.dcId +
                         " through Cloudflare Proxy (" + baseDomain + "); waiting for tunnel health")
                     return upstream
                 } catch (error: Exception) {
+                    if (!running.get()) return null
                     val failures = (cfProxyFailures[baseDomain] ?: 0) + 1
                     cfProxyFailures[baseDomain] = failures
                     val backoffSeconds = minOf(300L, 5L shl minOf(failures - 1, 5))
@@ -631,6 +682,7 @@ internal object LocalProxyEngine {
             5 -> "149.154.171.5"
             else -> return null
         }
+        if (!running.get()) return null
         val endpoint = "$ip:443"
         val retryAt = tcpRetryAfter[endpoint] ?: 0L
         if (retryAt > System.currentTimeMillis()) {
@@ -644,15 +696,17 @@ internal object LocalProxyEngine {
         }
         val socket = Socket()
         return try {
+            if (!registerUpstreamSocket(socket)) return null
             socket.connect(InetSocketAddress(ip, 443), 10000)
+            if (!running.get()) throw SocketException("Proxy stopped during TCP connect")
             socket.tcpNoDelay = true
             tcpFailures.remove(endpoint)
             tcpRetryAfter.remove(endpoint)
-            activeUpstreams.add(socket)
             log("Using direct TCP fallback to DC" + handshake.dcId)
             TcpUpstream(socket)
         } catch (error: Exception) {
-            runCatching { socket.close() }
+            unregisterUpstreamSocket(socket)
+            if (!running.get()) return null
             val failures = (tcpFailures[endpoint] ?: 0) + 1
             tcpFailures[endpoint] = failures
             val backoffSeconds = minOf(3600L, 30L shl minOf(failures - 1, 7))
@@ -672,8 +726,10 @@ internal object LocalProxyEngine {
         cfProxyDomain: String? = null,
         cfProxyDc: Int? = null
     ): WebSocketUpstream {
+        if (!running.get()) throw SocketException("Proxy is stopped")
         val socket = connectTlsSocketIpv4First(domain)
         try {
+            if (!running.get()) throw SocketException("Proxy stopped during TLS setup")
             val keyBytes = ByteArray(16).also { random.nextBytes(it) }
             val key = Base64.encodeToString(keyBytes, Base64.NO_WRAP)
             val request = (
@@ -717,10 +773,11 @@ internal object LocalProxyEngine {
             if (headers["sec-websocket-accept"] != expectedAccept) {
                 throw SocketException("Invalid WebSocket accept header")
             }
+            if (!running.get()) throw SocketException("Proxy stopped during WebSocket upgrade")
             socket.soTimeout = 0
             return WebSocketUpstream(socket, splitFrames, cfProxyDomain, cfProxyDc)
         } catch (error: Exception) {
-            runCatching { socket.close() }
+            unregisterUpstreamSocket(socket)
             throw error
         }
     }
@@ -731,25 +788,38 @@ internal object LocalProxyEngine {
      * UDP directly, while retaining the hostname for TLS SNI and verification.
      */
     private fun connectTlsSocketIpv4First(domain: String): SSLSocket {
+        if (!running.get()) throw SocketException("Proxy is stopped")
         val addresses = resolveIpv4(domain)
+        if (!running.get()) throw SocketException("Proxy stopped during DNS resolution")
         var lastError: Exception? = null
         for (address in addresses) {
+            if (!running.get()) throw SocketException("Proxy stopped before connecting to $domain")
             val raw = Socket()
+            if (!registerUpstreamSocket(raw)) throw SocketException("Proxy stopped before TCP connect")
+            var ssl: SSLSocket? = null
             try {
                 raw.tcpNoDelay = true
                 raw.connect(InetSocketAddress(address, 443), 7000)
-                val ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory)
+                if (!running.get()) throw SocketException("Proxy stopped during TCP connect")
+                ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory)
                     .createSocket(raw, domain, 443, true) as SSLSocket
+                if (!registerUpstreamSocket(ssl)) throw SocketException("Proxy stopped before TLS handshake")
+                // Register the TLS wrapper before dropping the raw socket so stop()
+                // can close either representation without an untracked interval.
+                activeUpstreams.remove(raw)
                 ssl.soTimeout = 12000
                 val parameters = ssl.sslParameters
                 parameters.endpointIdentificationAlgorithm = "HTTPS"
                 parameters.serverNames = listOf(SNIHostName(domain))
                 ssl.sslParameters = parameters
                 ssl.startHandshake()
+                if (!running.get()) throw SocketException("Proxy stopped during TLS handshake")
                 return ssl
             } catch (error: Exception) {
                 lastError = error
-                runCatching { raw.close() }
+                unregisterUpstreamSocket(raw)
+                ssl?.let(::unregisterUpstreamSocket)
+                if (!running.get()) throw SocketException("Proxy stopped while connecting to $domain")
             }
         }
         throw lastError ?: UnknownHostException("No IPv4 addresses for $domain")
@@ -813,22 +883,28 @@ internal object LocalProxyEngine {
     }
 
     private fun queryDohJson(host: String, resolverIp: String, path: String): String {
+        if (!running.get()) throw SocketException("Proxy is stopped")
         val raw = Socket()
-        raw.connect(InetSocketAddress(resolverIp, 443), 5000)
-        raw.soTimeout = 6000
-        val tls = try {
-            (SSLSocketFactory.getDefault() as SSLSocketFactory)
-                .createSocket(raw, host, 443, true) as SSLSocket
-        } catch (error: Exception) {
-            runCatching { raw.close() }
-            throw error
-        }
+        if (!registerUpstreamSocket(raw)) throw SocketException("Proxy stopped before DoH connect")
+        var tls: SSLSocket? = null
+        var rawStillTracked = true
         try {
-            val parameters = tls.sslParameters
+            raw.connect(InetSocketAddress(resolverIp, 443), 5000)
+            if (!running.get()) throw SocketException("Proxy stopped during DoH connect")
+            raw.soTimeout = 6000
+            val connectedTls = (SSLSocketFactory.getDefault() as SSLSocketFactory)
+                .createSocket(raw, host, 443, true) as SSLSocket
+            tls = connectedTls
+            if (!registerUpstreamSocket(connectedTls)) throw SocketException("Proxy stopped before DoH TLS")
+            activeUpstreams.remove(raw)
+            rawStillTracked = false
+            connectedTls.soTimeout = 6000
+            val parameters = connectedTls.sslParameters
             parameters.endpointIdentificationAlgorithm = "HTTPS"
             parameters.serverNames = listOf(SNIHostName(host))
-            tls.sslParameters = parameters
-            tls.startHandshake()
+            connectedTls.sslParameters = parameters
+            connectedTls.startHandshake()
+            if (!running.get()) throw SocketException("Proxy stopped during DoH TLS handshake")
 
             val request = "GET " + path + " HTTP/1.1\r\n" +
                 "Host: " + host + "\r\n" +
@@ -836,12 +912,12 @@ internal object LocalProxyEngine {
                 "Accept-Encoding: identity\r\n" +
                 "User-Agent: TGTunnel/1.0\r\n" +
                 "Connection: close\r\n\r\n"
-            tls.getOutputStream().apply {
+            connectedTls.getOutputStream().apply {
                 write(request.toByteArray(Charsets.US_ASCII))
                 flush()
             }
 
-            val input = tls.getInputStream()
+            val input = connectedTls.getInputStream()
             val headerBytes = ByteArrayOutputStream()
             var matched = 0
             val delimiter = byteArrayOf(13, 10, 13, 10)
@@ -872,7 +948,8 @@ internal object LocalProxyEngine {
             }
             return decoded.toString(Charsets.UTF_8)
         } finally {
-            runCatching { tls.close() }
+            if (rawStillTracked) unregisterUpstreamSocket(raw)
+            tls?.let(::unregisterUpstreamSocket)
         }
     }
 
