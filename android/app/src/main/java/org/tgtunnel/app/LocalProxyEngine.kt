@@ -377,21 +377,22 @@ internal object LocalProxyEngine {
         val domain = upstream.cfProxyDomain ?: return
         val dc = upstream.cfProxyDc ?: return
         val elapsed = System.currentTimeMillis() - upstream.connectedAtMs
-        if (upstream.receivedBytes > 0L || (elapsed >= 15_000L && !upstream.closedByPeer && !upstream.upstreamFailed)) {
-            cfProxyFailures.remove(domain)
-            cfProxyRetryAfter.remove(domain)
-            activeCfProxyDomains[dc] = domain
-            log("Cloudflare Proxy domain healthy: " + domain +
-                " (DC" + dc + ", received " + upstream.receivedBytes + " bytes)")
-        } else if (upstream.closedByPeer || upstream.upstreamFailed) {
+        val closedTooEarly = (upstream.closedByPeer || upstream.upstreamFailed) && elapsed < 15_000L
+        if (closedTooEarly) {
             val failures = (cfProxyFailures[domain] ?: 0) + 1
             cfProxyFailures[domain] = failures
             val backoffSeconds = minOf(300L, 5L shl minOf(failures - 1, 5))
             cfProxyRetryAfter[domain] = System.currentTimeMillis() + backoffSeconds * 1000L
             if (activeCfProxyDomains[dc] == domain) activeCfProxyDomains.remove(dc, domain)
             log("Cloudflare Proxy domain marked unhealthy: " + domain +
-                " (DC" + dc + ", received " + upstream.receivedBytes +
-                " bytes); retry in " + backoffSeconds + "s")
+                " (DC" + dc + ", age " + elapsed + "ms, received " +
+                upstream.receivedBytes + " bytes); retry in " + backoffSeconds + "s")
+        } else if (upstream.receivedBytes > 0L || elapsed >= 15_000L) {
+            cfProxyFailures.remove(domain)
+            cfProxyRetryAfter.remove(domain)
+            activeCfProxyDomains[dc] = domain
+            log("Cloudflare Proxy domain healthy: " + domain +
+                " (DC" + dc + ", age " + elapsed + "ms, received " + upstream.receivedBytes + " bytes)")
         }
     }
 
