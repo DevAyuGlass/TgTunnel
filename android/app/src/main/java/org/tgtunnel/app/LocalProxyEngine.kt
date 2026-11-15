@@ -451,12 +451,18 @@ internal object LocalProxyEngine {
                     val data = try {
                         upstream.receive()
                     } catch (error: Exception) {
-                        (upstream as? WebSocketUpstream)?.let {
-                            it.upstreamFailed = true
-                            it.upstreamFailure = error.message ?: error.javaClass.simpleName
+                        // Closing the upstream socket after a local client EOF or a
+                        // user stop also wakes this blocked read with "Socket closed".
+                        // That is a consequence of our own shutdown, not an upstream
+                        // transport failure and must not poison CF Proxy health.
+                        if (!finished.get() && running.get()) {
+                            (upstream as? WebSocketUpstream)?.let {
+                                it.upstreamFailed = true
+                                it.upstreamFailure = error.message ?: error.javaClass.simpleName
+                            }
+                            closeReason.compareAndSet("session ended", "upstream error: " +
+                                (error.message ?: error.javaClass.simpleName))
                         }
-                        closeReason.compareAndSet("session ended", "upstream error: " +
-                            (error.message ?: error.javaClass.simpleName))
                         throw error
                     }
                     if (data == null) {
