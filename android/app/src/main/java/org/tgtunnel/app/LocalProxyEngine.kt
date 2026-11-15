@@ -564,7 +564,7 @@ internal object LocalProxyEngine {
             return null
         }
         val socket = Socket()
-        try {
+        return try {
             socket.connect(InetSocketAddress(ip, 443), 10000)
             socket.tcpNoDelay = true
             tcpFailures.remove(endpoint)
