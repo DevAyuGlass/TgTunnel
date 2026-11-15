@@ -525,7 +525,12 @@ private fun EngineRow(title: String, value: String, valueColor: Color = TextPrim
 @Composable
 private fun LogsCard(logs: List<LogEntry>) {
     val clipboard = LocalClipboardManager.current
-    val logText = logs.asReversed().joinToString("\\n") { "[${it.time}] ${it.message}" }
+    val logText = buildString {
+        appendLine("TGTunnel — журнал событий")
+        appendLine("Записей: ${logs.size}")
+        appendLine()
+        append(logs.asReversed().joinToString("\n") { "[${it.time}] ${it.message}" })
+    }
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(18.dp),
