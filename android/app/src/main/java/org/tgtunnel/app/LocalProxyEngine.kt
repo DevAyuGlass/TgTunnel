@@ -111,6 +111,8 @@ internal object LocalProxyEngine {
         @Volatile var receivedBytes: Long = 0L
         @Volatile var firstReceivedAtMs: Long = 0L
         @Volatile var sentBytes: Long = 0L
+        @Volatile var firstSentAtMs: Long = 0L
+        private val firstResponseLogged = AtomicBoolean(false)
         @Volatile var closedByPeer: Boolean = false
         @Volatile var closeCode: Int? = null
         @Volatile var closeReason: String = ""
@@ -152,6 +154,7 @@ internal object LocalProxyEngine {
                 for (i in payload.indices) masked[i] = (payload[i].toInt() xor mask[i and 3].toInt()).toByte()
                 output.write(masked)
                 output.flush()
+                if (sentBytes == 0L) firstSentAtMs = System.currentTimeMillis()
                 sentBytes += length.toLong()
             }
         }
@@ -212,7 +215,16 @@ internal object LocalProxyEngine {
                             val result = fragments.toByteArray()
                             fragments.reset()
                             if (opcode == 0x1) continue
-                            if (firstReceivedAtMs == 0L) firstReceivedAtMs = System.currentTimeMillis()
+                            if (firstReceivedAtMs == 0L) {
+                                firstReceivedAtMs = System.currentTimeMillis()
+                                if (firstResponseLogged.compareAndSet(false, true)) {
+                                    val responseDelay = if (firstSentAtMs > 0L) firstReceivedAtMs - firstSentAtMs else -1L
+                                    log("Cloudflare/Telegram WebSocket first binary response: " +
+                                        result.size + " bytes after " +
+                                        (if (responseDelay >= 0L) responseDelay.toString() + "ms from first send" else "unknown send time") +
+                                        (cfProxyDomain?.let { " · CF domain=" + it + " DC" + (cfProxyDc ?: "?") } ?: ""))
+                                }
+                            }
                             return result
                         }
                     }
