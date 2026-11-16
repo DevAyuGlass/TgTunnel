@@ -181,6 +181,8 @@ internal object LocalProxyEngine {
                 val mask = if ((second and 0x80) != 0) readExact(4) else null
                 val payload = readExact(length.toInt())
                 lastFrameReceivedAtMs = System.currentTimeMillis()
+                // Any upstream frame proves the transport is alive; do not leave an old Ping outstanding.
+                if (lastPingAtMs > 0L) lastPingAtMs = 0L
                 if (mask != null) {
                     for (i in payload.indices) payload[i] = (payload[i].toInt() xor mask[i and 3].toInt()).toByte()
                 }
@@ -373,12 +375,14 @@ internal object LocalProxyEngine {
                 }
                 client.tcpNoDelay = true
                 activeClients.add(client)
+                log("Local client accepted · active sessions=" + activeClients.size)
                 Thread({
                     try {
                         handleClient(client, secret)
                     } finally {
                         activeClients.remove(client)
                         runCatching { client.close() }
+                        if (running.get()) log("Local client session ended · listener remains ready for Telegram reconnect")
                     }
                 }, "tgtunnel-client").apply {
                     isDaemon = true
@@ -603,10 +607,9 @@ internal object LocalProxyEngine {
             while (!finished.get() && running.get()) {
                 val count = clientInput.read(buffer)
                 if (count < 0) {
-                    closeReason.compareAndSet(
-                        "session ended",
-                        "client EOF from " + (client.remoteSocketAddress?.toString() ?: "unknown")
-                    )
+                    val peer = client.remoteSocketAddress?.toString() ?: "unknown"
+                    closeReason.compareAndSet("session ended", "client EOF from " + peer)
+                    log("Local client sent EOF · closing its upstream session; listener stays available for reconnect")
                     wsSplitter?.flush()?.forEach {
                         upstream.send(it)
                         upPackets.incrementAndGet()
