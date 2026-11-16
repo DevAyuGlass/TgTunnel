@@ -84,7 +84,7 @@ internal class TlsClientHelloFragmentingSocket(
             if (buffered.size < totalLength) return
 
             val firstPayloadLength = recordLength / 2
-            writeRecord(buffered, 0, firstPayloadLength)
+            writeRecord(buffered, TLS_RECORD_HEADER_SIZE, firstPayloadLength)
             writeRecord(
                 buffered,
                 TLS_RECORD_HEADER_SIZE + firstPayloadLength,
