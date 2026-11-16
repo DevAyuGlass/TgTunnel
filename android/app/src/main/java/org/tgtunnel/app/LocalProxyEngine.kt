@@ -219,7 +219,7 @@ internal object LocalProxyEngine {
                                 firstReceivedAtMs = System.currentTimeMillis()
                                 if (firstResponseLogged.compareAndSet(false, true)) {
                                     val responseDelay = if (firstSentAtMs > 0L) firstReceivedAtMs - firstSentAtMs else -1L
-                                    log("Cloudflare/Telegram WebSocket first binary response: " +
+                                    log("WebSocket first binary response: " +
                                         result.size + " bytes after " +
                                         (if (responseDelay >= 0L) responseDelay.toString() + "ms from first send" else "unknown send time") +
                                         (cfProxyDomain?.let { " · CF domain=" + it + " DC" + (cfProxyDc ?: "?") } ?: ""))
@@ -636,6 +636,44 @@ internal object LocalProxyEngine {
         } else {
             listOf("kws" + dcForDomain + ".web.telegram.org")
         }
+        // Flowseal's CF Proxy tier: connect to kws<dc>.<Cloudflare-proxied-domain>.
+        // It is independent from the optional user-owned Worker tunnel above.
+        if (cloudflareProxyEnabled) {
+            val preferred = activeCfProxyDomains[dcForDomain]
+            val now = System.currentTimeMillis()
+            val candidates = buildList {
+                if (preferred != null && (cfProxyRetryAfter[preferred] ?: 0L) <= now) add(preferred)
+                addAll(cfProxyDomains.shuffled().filter {
+                    it != preferred && (cfProxyRetryAfter[it] ?: 0L) <= now
+                })
+            }
+            if (candidates.isEmpty()) {
+                log("Cloudflare Proxy pool is cooling down; retrying with the full pool")
+            }
+            for (baseDomain in candidates.ifEmpty { cfProxyDomains.shuffled() }) {
+                if (!running.get()) return null
+                val host = "kws" + dcForDomain + "." + baseDomain
+                try {
+                    val upstream = connectWebSocket(host, cfProxyDomain = baseDomain, cfProxyDc = dcForDomain)
+                    if (!running.get()) {
+                        unregisterUpstreamSocket(extractSocket(upstream))
+                        return null
+                    }
+                    log("WebSocket established to DC" + handshake.dcId +
+                        " through Cloudflare Proxy (" + baseDomain + "); waiting for tunnel health")
+                    return upstream
+                } catch (error: Exception) {
+                    if (!running.get()) return null
+                    val failures = (cfProxyFailures[baseDomain] ?: 0) + 1
+                    cfProxyFailures[baseDomain] = failures
+                    val backoffSeconds = minOf(300L, 5L shl minOf(failures - 1, 5))
+                    cfProxyRetryAfter[baseDomain] = System.currentTimeMillis() + backoffSeconds * 1000L
+                    log("Cloudflare Proxy " + baseDomain + " failed (retry in " + backoffSeconds + "s): " +
+                        (error.message ?: error.javaClass.simpleName))
+                }
+            }
+        }
+
         val redirectIp = dcRedirects[dcForDomain]
         for (domain in domains) {
             if (!running.get()) return null
@@ -687,44 +725,6 @@ internal object LocalProxyEngine {
                         log("Cloudflare Worker " + worker + " for " + destination + " failed: " +
                             (error.message ?: error.javaClass.simpleName))
                     }
-                }
-            }
-        }
-
-        // Flowseal's CF Proxy tier: connect to kws<dc>.<Cloudflare-proxied-domain>.
-        // It is independent from the optional user-owned Worker tunnel above.
-        if (cloudflareProxyEnabled) {
-            val preferred = activeCfProxyDomains[dcForDomain]
-            val now = System.currentTimeMillis()
-            val candidates = buildList {
-                if (preferred != null && (cfProxyRetryAfter[preferred] ?: 0L) <= now) add(preferred)
-                addAll(cfProxyDomains.shuffled().filter {
-                    it != preferred && (cfProxyRetryAfter[it] ?: 0L) <= now
-                })
-            }
-            if (candidates.isEmpty()) {
-                log("Cloudflare Proxy pool is cooling down; retrying with the full pool")
-            }
-            for (baseDomain in candidates.ifEmpty { cfProxyDomains.shuffled() }) {
-                if (!running.get()) return null
-                val host = "kws" + dcForDomain + "." + baseDomain
-                try {
-                    val upstream = connectWebSocket(host, cfProxyDomain = baseDomain, cfProxyDc = dcForDomain)
-                    if (!running.get()) {
-                        unregisterUpstreamSocket(extractSocket(upstream))
-                        return null
-                    }
-                    log("WebSocket established to DC" + handshake.dcId +
-                        " through Cloudflare Proxy (" + baseDomain + "); waiting for tunnel health")
-                    return upstream
-                } catch (error: Exception) {
-                    if (!running.get()) return null
-                    val failures = (cfProxyFailures[baseDomain] ?: 0) + 1
-                    cfProxyFailures[baseDomain] = failures
-                    val backoffSeconds = minOf(300L, 5L shl minOf(failures - 1, 5))
-                    cfProxyRetryAfter[baseDomain] = System.currentTimeMillis() + backoffSeconds * 1000L
-                    log("Cloudflare Proxy " + baseDomain + " failed (retry in " + backoffSeconds + "s): " +
-                        (error.message ?: error.javaClass.simpleName))
                 }
             }
         }
