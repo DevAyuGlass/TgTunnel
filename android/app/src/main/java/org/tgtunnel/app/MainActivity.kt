@@ -107,7 +107,7 @@ private val logWriter = Executors.newSingleThreadExecutor { runnable ->
 private enum class Screen { HOME, SETTINGS, LOGS }
 private enum class ConnectionState { DISCONNECTED, CONNECTED, ERROR }
 
-private data class AppSettings(
+internal data class AppSettings(
     val port: String = "1443",
     val secret: String = "",
     val autostart: Boolean = false,
