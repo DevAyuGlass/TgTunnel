@@ -10,8 +10,8 @@ internal object NativeBridge {
 
     fun isRunning(): Boolean = LocalProxyEngine.isRunning()
 
-    fun start(port: Int, secret: String, workerDomain: String, cfProxyEnabled: Boolean, dcIp: String, onLog: (String) -> Unit): String =
-        LocalProxyEngine.start(port, secret, workerDomain, cfProxyEnabled, dcIp, onLog)
+    fun start(port: Int, secret: String, workerDomain: String, cfProxyEnabled: Boolean, dcIp: String, tlsClientHelloSplit: Boolean, onLog: (String) -> Unit): String =
+        LocalProxyEngine.start(port, secret, workerDomain, cfProxyEnabled, dcIp, tlsClientHelloSplit, onLog)
 
     fun stop(): String = LocalProxyEngine.stop()
 }
