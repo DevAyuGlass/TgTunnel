@@ -39,6 +39,8 @@ internal fun stopTunnelService(context: Context) {
 class TunnelForegroundService : Service() {
     private val executor = Executors.newSingleThreadExecutor()
     private val starting = AtomicBoolean(false)
+    @Volatile private var stopping = false
+    private val notificationLock = Any()
 
     override fun onCreate() {
         super.onCreate()
@@ -48,14 +50,16 @@ class TunnelForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP_TUNNEL) {
+            stopping = true
             getSharedPreferences(SERVICE_PREFS, MODE_PRIVATE).edit().putBoolean(KEY_WAS_RUNNING, false).apply()
             NativeBridge.stop()
             TunnelEvents.emit("SERVICE_STATE:STOPPED · TGTunnel остановлен")
-            stopForeground(STOP_FOREGROUND_REMOVE)
+            removeForegroundNotification()
             stopSelf()
             return START_NOT_STICKY
         }
 
+        stopping = false
         if (starting.compareAndSet(false, true)) {
             val prefs = getSharedPreferences("tgtunnel_settings", MODE_PRIVATE)
             val port = intent?.getIntExtra("port", prefs.getInt("local_port", 1443)) ?: prefs.getInt("local_port", 1443)
@@ -79,8 +83,8 @@ class TunnelForegroundService : Service() {
                 } else {
                     getSharedPreferences(SERVICE_PREFS, MODE_PRIVATE).edit().putBoolean(KEY_WAS_RUNNING, false).apply()
                     TunnelEvents.emit("SERVICE_STATE:ERROR · Ошибка запуска: " + result.removePrefix("ERR:"))
-                    updateNotification("Ошибка запуска — откройте TGTunnel")
-                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopping = true
+                    removeForegroundNotification()
                     stopSelf()
                 }
             }
@@ -94,6 +98,8 @@ class TunnelForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        stopping = true
+        removeForegroundNotification()
         executor.shutdown()
         super.onDestroy()
     }
@@ -129,6 +135,21 @@ class TunnelForegroundService : Service() {
     }
 
     private fun updateNotification(status: String) {
-        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(status))
+        synchronized(notificationLock) {
+            if (stopping) return
+            getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(status))
+        }
+    }
+
+    private fun removeForegroundNotification() {
+        synchronized(notificationLock) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } else {
+                @Suppress("DEPRECATION")
+                stopForeground(true)
+            }
+            getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
+        }
     }
 }
