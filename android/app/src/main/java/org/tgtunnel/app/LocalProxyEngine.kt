@@ -1056,13 +1056,10 @@ internal object LocalProxyEngine {
                 raw.tcpNoDelay = true
                 raw.connect(InetSocketAddress(address, 443), 7000)
                 if (!running.get()) throw SocketException("Proxy stopped during TCP connect")
-                // Fragment only the visible TLS ClientHello record for Telegram upstream routes.
-                // This is TLS-record fragmentation, not a guarantee of separate TCP segments.
-                val tlsTransport = TlsClientHelloFragmentingSocket(raw) {
-                    log("Telegram DPI: TLS ClientHello split across two records")
-                }
+                // Keep the proven TLS transport enabled by default.
+                // ClientHello fragmentation remains experimental until device-side validation.
                 ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory)
-                    .createSocket(tlsTransport, tlsSni, 443, true) as SSLSocket
+                    .createSocket(raw, tlsSni, 443, true) as SSLSocket
                 if (!registerUpstreamSocket(ssl)) throw SocketException("Proxy stopped before TLS handshake")
                 // Register the TLS wrapper before dropping the raw socket so stop()
                 // can close either representation without an untracked interval.
