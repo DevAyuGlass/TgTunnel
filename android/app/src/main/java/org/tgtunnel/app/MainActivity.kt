@@ -90,7 +90,6 @@ private const val KEY_VERBOSE = "verbose_logs"
 private const val KEY_SECRET = "mtproto_secret"
 private const val KEY_CF_WORKER = "cloudflare_worker_domain"
 private const val KEY_CF_PROXY = "cloudflare_proxy_fallback"
-private const val KEY_TLS_HELLO_SPLIT = "tls_clienthello_split"
 private const val KEY_DC_IP = "dc_ip_redirects"
 private const val KEY_LOG_FOLDER_URI = "log_folder_uri"
 private const val KEY_LOG_FILE_URI = "log_file_uri"
@@ -117,7 +116,6 @@ internal data class AppSettings(
     val verboseLogs: Boolean = false,
     val workerDomain: String = "",
     val cfProxyFallback: Boolean = true,
-    val tlsClientHelloSplit: Boolean = false,
     val dcIp: String = DEFAULT_DC_IP,
     val logFolderUri: String = ""
 )
@@ -162,7 +160,6 @@ private fun TgTunnelApp() {
                 verboseLogs = preferences.getBoolean(KEY_VERBOSE, false),
                 workerDomain = preferences.getString(KEY_CF_WORKER, "") ?: "",
                 cfProxyFallback = preferences.getBoolean(KEY_CF_PROXY, true),
-                tlsClientHelloSplit = preferences.getBoolean(KEY_TLS_HELLO_SPLIT, false),
                 dcIp = preferences.getString(KEY_DC_IP, DEFAULT_DC_IP) ?: DEFAULT_DC_IP,
                 logFolderUri = preferences.getString(KEY_LOG_FOLDER_URI, "") ?: ""
             )
@@ -191,7 +188,6 @@ private fun TgTunnelApp() {
             .putBoolean(KEY_VERBOSE, next.verboseLogs)
             .putString(KEY_CF_WORKER, next.workerDomain)
             .putBoolean(KEY_CF_PROXY, next.cfProxyFallback)
-            .putBoolean(KEY_TLS_HELLO_SPLIT, next.tlsClientHelloSplit)
             .putString(KEY_DC_IP, next.dcIp)
             .putString(KEY_LOG_FOLDER_URI, next.logFolderUri)
         if (folderChanged) editor.remove(KEY_LOG_FILE_URI).remove(KEY_LOG_FILE_DAY).remove(KEY_LOG_FILE_TREE_URI)
@@ -907,12 +903,6 @@ private fun SettingsScreen(
                     subtitle = "Автоматический пул доменов Flowseal, без собственного домена",
                     checked = settings.cfProxyFallback,
                     onCheckedChange = { onSettingsChanged(settings.copy(cfProxyFallback = it)) }
-                )
-                SettingSwitch(
-                    title = "TLS ClientHello fragmentation",
-                    subtitle = "Экспериментальное разделение первого TLS record. По умолчанию выключено; включай только для теста.",
-                    checked = settings.tlsClientHelloSplit,
-                    onCheckedChange = { onSettingsChanged(settings.copy(tlsClientHelloSplit = it)) }
                 )
             }
         }
