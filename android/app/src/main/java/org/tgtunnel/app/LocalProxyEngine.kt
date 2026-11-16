@@ -118,6 +118,9 @@ internal object LocalProxyEngine {
         @Volatile var closeReason: String = ""
         @Volatile var upstreamFailure: String = ""
         @Volatile var upstreamFailed: Boolean = false
+        @Volatile var lastFrameReceivedAtMs: Long = connectedAtMs
+        @Volatile var lastPongAtMs: Long = connectedAtMs
+        @Volatile var lastPingAtMs: Long = 0L
         override fun socketForTracking(): Socket = socket
         private val input: InputStream = socket.getInputStream()
         private val output: OutputStream = socket.getOutputStream()
@@ -177,6 +180,7 @@ internal object LocalProxyEngine {
                 }
                 val mask = if ((second and 0x80) != 0) readExact(4) else null
                 val payload = readExact(length.toInt())
+                lastFrameReceivedAtMs = System.currentTimeMillis()
                 if (mask != null) {
                     for (i in payload.indices) payload[i] = (payload[i].toInt() xor mask[i and 3].toInt()).toByte()
                 }
@@ -200,7 +204,9 @@ internal object LocalProxyEngine {
                     0x9 -> {
                         sendFrame(0xA, payload)
                     }
-                    0xA -> Unit
+                    0xA -> {
+                        lastPongAtMs = System.currentTimeMillis()
+                    }
                     0x2, 0x0, 0x1 -> {
                         // Only binary WebSocket messages carry the MTProto stream.
                         // Text/control traffic must never count as tunnel health.
@@ -249,6 +255,12 @@ internal object LocalProxyEngine {
                 offset += count
             }
             return result
+        }
+
+        fun sendHealthPing() {
+            val now = System.currentTimeMillis()
+            sendFrame(0x9, ByteArray(8).also { random.nextBytes(it) })
+            lastPingAtMs = now
         }
 
         override fun close() {
@@ -492,6 +504,43 @@ internal object LocalProxyEngine {
         val upPackets = AtomicLong(0L)
         val downPackets = AtomicLong(0L)
         val startedAt = System.currentTimeMillis()
+        val wsHealth = upstream as? WebSocketUpstream
+        val healthMonitor = if (wsHealth != null) Thread({
+            while (!finished.get() && running.get()) {
+                try { Thread.sleep(15_000L) } catch (_: InterruptedException) { break }
+                if (finished.get() || !running.get()) break
+                val now = System.currentTimeMillis()
+                val lastPing = wsHealth.lastPingAtMs
+                val lastFrame = wsHealth.lastFrameReceivedAtMs
+                if (lastPing > 0L && lastFrame <= lastPing && now - lastPing >= 40_000L) {
+                    val reason = "WebSocket health timeout: no frame/Pong for " + (now - lastPing) + "ms"
+                    wsHealth.upstreamFailed = true
+                    wsHealth.upstreamFailure = reason
+                    closeReason.compareAndSet("session ended", reason)
+                    log(reason + " · closing local client so Telegram can reconnect")
+                    finished.set(true)
+                    runCatching { client.close() }
+                    runCatching { upstream.close() }
+                    break
+                }
+                if (now - lastFrame >= 20_000L && (lastPing == 0L || lastPing <= wsHealth.lastPongAtMs)) {
+                    try {
+                        wsHealth.sendHealthPing()
+                        log("WebSocket health check: Ping sent after " + (now - lastFrame) + "ms without upstream frames")
+                    } catch (error: Exception) {
+                        val reason = "WebSocket health Ping failed: " + (error.message ?: error.javaClass.simpleName)
+                        wsHealth.upstreamFailed = true
+                        wsHealth.upstreamFailure = reason
+                        closeReason.compareAndSet("session ended", reason)
+                        log(reason + " · closing local client so Telegram can reconnect")
+                        finished.set(true)
+                        runCatching { client.close() }
+                        runCatching { upstream.close() }
+                        break
+                    }
+                }
+            }
+        }, "tgtunnel-ws-health").apply { isDaemon = true; start() } else null
         var firstClientPayloadLogged = false
         var splitterDiagnosticLogged = false
         val clientInput = client.getInputStream()
@@ -596,24 +645,29 @@ internal object LocalProxyEngine {
                 }
             }
         } catch (error: Exception) {
-            closeReason.compareAndSet("session ended", "client error: " +
-                (error.message ?: error.javaClass.simpleName))
+            val detail = error.message ?: error.javaClass.simpleName
+            closeReason.compareAndSet("session ended", "client read/write error: " + error.javaClass.simpleName + ": " + detail)
             if (running.get() && !finished.get()) {
-                log("Client -> upstream bridge error: " +
-                    (error.message ?: error.javaClass.simpleName))
+                log("Client socket operation failed: " + error.javaClass.simpleName + ": " + detail +
+                    " · localClosed=" + client.isClosed + " inputShutdown=" + client.isInputShutdown +
+                    " outputShutdown=" + client.isOutputShutdown)
             }
         } finally {
             finished.set(true)
             runCatching { client.close() }
             upstream.close()
             runCatching { upstreamToClient.join(1000) }
+            healthMonitor?.interrupt()
+            runCatching { healthMonitor?.join(500) }
             val elapsed = System.currentTimeMillis() - startedAt
             val ws = upstream as? WebSocketUpstream
             wsSplitter?.let { log("MTProto framing at close: " + it.diagnosticSnapshot()) }
-            log("Bridge closed (${closeReason.get()}): " +
+            val finalReason = closeReason.get()
+            log("Bridge closed (${finalReason}): " +
                 "client→upstream ${upBytes.get()} bytes/${upPackets.get()} reads, " +
                 "upstream→client ${downBytes.get()} bytes/${downPackets.get()} frames, " +
                 "elapsed ${elapsed}ms" +
+                ", localSocket(closed=${client.isClosed}, inputShutdown=${client.isInputShutdown}, outputShutdown=${client.isOutputShutdown})" +
                 (ws?.let {
                     ", WS sent=${it.sentBytes} received=${it.receivedBytes}" +
                         (if (it.closeCode != null) ", closeCode=${it.closeCode}" else "") +
