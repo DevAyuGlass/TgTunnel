@@ -88,6 +88,7 @@ private const val KEY_DC_IP = "dc_ip_redirects"
 private const val KEY_LOG_FOLDER_URI = "log_folder_uri"
 private const val KEY_LOG_FILE_URI = "log_file_uri"
 private const val KEY_LOG_FILE_DAY = "log_file_day"
+private const val KEY_LOG_FILE_TREE_URI = "log_file_tree_uri"
 private const val DEFAULT_DC_IP = "2:149.154.167.220,4:149.154.167.220"
 
 private val logIds = AtomicLong(0)
@@ -170,7 +171,7 @@ private fun TgTunnelApp() {
             .putBoolean(KEY_CF_PROXY, next.cfProxyFallback)
             .putString(KEY_DC_IP, next.dcIp)
             .putString(KEY_LOG_FOLDER_URI, next.logFolderUri)
-        if (folderChanged) editor.remove(KEY_LOG_FILE_URI).remove(KEY_LOG_FILE_DAY)
+        if (folderChanged) editor.remove(KEY_LOG_FILE_URI).remove(KEY_LOG_FILE_DAY).remove(KEY_LOG_FILE_TREE_URI)
         editor.apply()
     }
 
@@ -822,10 +823,12 @@ private fun appendPersistentLog(context: Context, treeUriText: String, entry: Lo
         try {
             val resolver = context.contentResolver
             val preferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            if (preferences.getString(KEY_LOG_FOLDER_URI, "") != treeUriText) return@execute
             val day = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
             var fileUriText = preferences.getString(KEY_LOG_FILE_URI, null)
             val savedDay = preferences.getString(KEY_LOG_FILE_DAY, null)
-            if (fileUriText.isNullOrBlank() || savedDay != day) {
+            val savedTreeUri = preferences.getString(KEY_LOG_FILE_TREE_URI, null)
+            if (fileUriText.isNullOrBlank() || savedDay != day || savedTreeUri != treeUriText) {
                 val treeUri = Uri.parse(treeUriText)
                 val treeDocumentId = DocumentsContract.getTreeDocumentId(treeUri)
                 val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, treeDocumentId)
@@ -839,6 +842,7 @@ private fun appendPersistentLog(context: Context, treeUriText: String, entry: Lo
                 preferences.edit()
                     .putString(KEY_LOG_FILE_URI, fileUriText)
                     .putString(KEY_LOG_FILE_DAY, day)
+                    .putString(KEY_LOG_FILE_TREE_URI, treeUriText)
                     .apply()
             }
             val fileUri = Uri.parse(fileUriText)
