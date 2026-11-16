@@ -260,9 +260,8 @@ internal object LocalProxyEngine {
         }
 
         fun sendHealthPing() {
-            val now = System.currentTimeMillis()
+            lastPingAtMs = System.currentTimeMillis()
             sendFrame(0x9, ByteArray(8).also { random.nextBytes(it) })
-            lastPingAtMs = now
         }
 
         override fun close() {
