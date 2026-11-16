@@ -1,6 +1,8 @@
 package org.tgtunnel.app
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.content.Intent
 import android.os.Build
 import android.net.Uri
@@ -132,6 +134,10 @@ internal object TunnelEvents {
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 9443)
+        }
         window.statusBarColor = android.graphics.Color.rgb(11, 17, 24)
         window.navigationBarColor = android.graphics.Color.rgb(11, 17, 24)
 
