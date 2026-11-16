@@ -712,7 +712,7 @@ private fun LogViewerScreen(logs: List<LogEntry>, onBack: () -> Unit) {
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            listOf("ВСЕ", "INFO", "WARN", "ERROR").forEach { level ->
+            listOf("ВСЕ", "CONNECT", "INFO", "WARN", "ERROR").forEach { level ->
                 TextButton(onClick = { selectedLevel = level }) {
                     Text(
                         level,
@@ -748,7 +748,7 @@ private fun LogViewerScreen(logs: List<LogEntry>, onBack: () -> Unit) {
             items(visibleLogs, key = { it.id }) { entry ->
                 Row(
                     modifier = Modifier.fillMaxWidth()
-                        .background(Panel, RoundedCornerShape(10.dp))
+                        .background(logBackground(entry.message), RoundedCornerShape(10.dp))
                         .padding(horizontal = 10.dp, vertical = 9.dp),
                     horizontalArrangement = Arrangement.spacedBy(9.dp),
                     verticalAlignment = Alignment.Top
@@ -762,7 +762,7 @@ private fun LogViewerScreen(logs: List<LogEntry>, onBack: () -> Unit) {
                     )
                     Text(
                         entry.message,
-                        color = TextPrimary,
+                        color = logColor(entry.message),
                         fontSize = 11.sp,
                         modifier = Modifier.weight(1f)
                     )
@@ -792,6 +792,16 @@ private fun logLevel(message: String): String {
     return when {
         listOf("error", "failed", "exception", "unable", "не удалось", "ошибка", "abort").any { value.contains(it) } -> "ERROR"
         listOf("warning", "inconclusive", "retry", "предупреждение").any { value.contains(it) } -> "WARN"
+        listOf(
+            "websocket established",
+            "client connected",
+            "connected to ",
+            "first binary response",
+            "route promoted",
+            "route selected",
+            "domain healthy",
+            "local listener started"
+        ).any { value.contains(it) } -> "CONNECT"
         else -> "INFO"
     }
 }
@@ -799,8 +809,12 @@ private fun logLevel(message: String): String {
 private fun logColor(message: String): Color = when (logLevel(message)) {
     "ERROR" -> ErrorRed
     "WARN" -> AccentPurple
+    "CONNECT" -> ConnectedGreen
     else -> TextPrimary
 }
+
+private fun logBackground(message: String): Color =
+    if (logLevel(message) == "CONNECT") Color(0xFF10271F) else Panel
 
 @Composable
 private fun SettingsScreen(
