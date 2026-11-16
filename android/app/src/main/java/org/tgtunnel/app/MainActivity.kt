@@ -2,6 +2,7 @@ package org.tgtunnel.app
 
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.net.Uri
 import android.provider.DocumentsContract
 import android.os.Bundle
@@ -123,6 +124,11 @@ private data class LogEntry(
     val message: String
 )
 
+internal object TunnelEvents {
+    @Volatile var listener: ((String) -> Unit)? = null
+    fun emit(message: String) { listener?.invoke(message) }
+}
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -203,20 +209,26 @@ private fun TgTunnelApp() {
     BackHandler(enabled = screen != Screen.HOME) { screen = Screen.HOME }
 
     LaunchedEffect(Unit) {
+        TunnelEvents.listener = { message ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                when {
+                    message.startsWith("SERVICE_STATE:CONNECTED") -> connectionState = ConnectionState.CONNECTED
+                    message.startsWith("SERVICE_STATE:ERROR") -> connectionState = ConnectionState.ERROR
+                    message.startsWith("SERVICE_STATE:STOPPED") -> connectionState = ConnectionState.DISCONNECTED
+                }
+                if (!message.startsWith("SERVICE_STATE:")) addLog(message)
+                else addLog(message.substringAfter(':'))
+            }
+        }
         if (NativeBridge.isRunning()) {
             connectionState = ConnectionState.CONNECTED
         } else if (settings.autostart) {
-            val port = settings.port.toIntOrNull()
-            if (port != null && port in 1..65535) {
-                val result = withContext(Dispatchers.IO) {
-                    NativeBridge.start(port, settings.secret, settings.workerDomain, settings.cfProxyFallback, settings.dcIp) { message ->
-                        android.os.Handler(android.os.Looper.getMainLooper()).post { addLog(message) }
-                    }
-                }
-                connectionState = if (result.startsWith("OK:")) ConnectionState.CONNECTED else ConnectionState.ERROR
-                addLog("Автозапуск: " + result.removePrefix("OK:").removePrefix("ERR:"))
-            }
+            startTunnelService(context, settings)
+            addLog("Запрошен фоновый автозапуск TGTunnel")
         }
+    }
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose { TunnelEvents.listener = null }
     }
 
     MaterialTheme(
@@ -247,17 +259,9 @@ private fun TgTunnelApp() {
                             if (!connectionBusy) {
                                 connectionBusy = true
                                 scope.launch {
-                                    val result = withContext(Dispatchers.IO) {
-                                        NativeBridge.start(port, settings.secret, settings.workerDomain, settings.cfProxyFallback, settings.dcIp) { message ->
-                                            android.os.Handler(android.os.Looper.getMainLooper()).post { addLog(message) }
-                                        }
-                                    }
-                                    connectionState = if (result.startsWith("OK:")) {
-                                        ConnectionState.CONNECTED
-                                    } else {
-                                        ConnectionState.ERROR
-                                    }
-                                    addLog(result.removePrefix("OK:").removePrefix("ERR:"))
+                                    startTunnelService(context, settings)
+                                    connectionState = ConnectionState.CONNECTED
+                                    addLog("Запуск фонового сервиса TGTunnel…")
                                     connectionBusy = false
                                 }
                             }
@@ -267,9 +271,9 @@ private fun TgTunnelApp() {
                         if (!connectionBusy) {
                             connectionBusy = true
                             scope.launch {
-                                val result = withContext(Dispatchers.IO) { NativeBridge.stop() }
+                                stopTunnelService(context)
                                 connectionState = ConnectionState.DISCONNECTED
-                                addLog(result)
+                                addLog("Запрошена остановка TGTunnel")
                                 connectionBusy = false
                             }
                         }
