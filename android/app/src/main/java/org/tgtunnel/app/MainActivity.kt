@@ -12,6 +12,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -415,10 +416,21 @@ private fun ConnectionCard(
         ConnectionState.DISCONNECTED -> "Локальный MTProto-прокси не запущен"
     }
 
+    val cardShape = RoundedCornerShape(24.dp)
+    val connectedHighlight = state == ConnectionState.CONNECTED
+    val cardBackground = if (connectedHighlight) Color(0xFF10271F) else Panel
+    val cardBorder = when (state) {
+        ConnectionState.CONNECTED -> ConnectedGreen.copy(alpha = 0.75f)
+        ConnectionState.ERROR -> ErrorRed.copy(alpha = 0.65f)
+        ConnectionState.DISCONNECTED -> Color.Transparent
+    }
+
     Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(24.dp),
-        colors = CardDefaults.cardColors(containerColor = Panel),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, cardBorder, cardShape),
+        shape = cardShape,
+        colors = CardDefaults.cardColors(containerColor = cardBackground),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Column(
@@ -434,7 +446,7 @@ private fun ConnectionCard(
             )
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
                 Box(Modifier.size(9.dp).background(statusColor, CircleShape))
-                Text(statusText, color = TextPrimary, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                Text(statusText, color = statusColor, fontSize = 24.sp, fontWeight = FontWeight.Bold)
             }
             Text(description, color = TextSecondary, fontSize = 12.sp)
             Spacer(Modifier.height(4.dp))
