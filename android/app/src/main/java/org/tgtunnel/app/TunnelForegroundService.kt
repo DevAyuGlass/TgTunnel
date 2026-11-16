@@ -27,6 +27,7 @@ internal fun startTunnelService(context: Context, settings: AppSettings) {
         putExtra("worker", settings.workerDomain)
         putExtra("cf_proxy", settings.cfProxyFallback)
         putExtra("dc_ip", settings.dcIp)
+        putExtra("tls_hello_split", settings.tlsClientHelloSplit)
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(intent)
     else context.startService(intent)
@@ -68,10 +69,12 @@ class TunnelForegroundService : Service() {
             val cfProxy = intent?.getBooleanExtra("cf_proxy", prefs.getBoolean("cloudflare_proxy_fallback", true))
                 ?: prefs.getBoolean("cloudflare_proxy_fallback", true)
             val dcIp = intent?.getStringExtra("dc_ip") ?: (prefs.getString("dc_ip_redirects", "2:149.154.167.220,4:149.154.167.220") ?: "")
+            val tlsHelloSplit = intent?.getBooleanExtra("tls_hello_split", prefs.getBoolean("tls_clienthello_split", false))
+                ?: prefs.getBoolean("tls_clienthello_split", false)
             getSharedPreferences(SERVICE_PREFS, MODE_PRIVATE).edit().putBoolean(KEY_WAS_RUNNING, true).apply()
             executor.execute {
                 val result = if (NativeBridge.isRunning()) "OK:Proxy already running" else
-                    NativeBridge.start(port, secret, worker, cfProxy, dcIp) { message ->
+                    NativeBridge.start(port, secret, worker, cfProxy, dcIp, tlsHelloSplit) { message ->
                         TunnelEvents.emit(message)
                         updateNotification("Работает · 127.0.0.1:" + port)
                     }
