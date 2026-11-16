@@ -9,6 +9,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.net.URLEncoder
 import java.net.HttpURLConnection
@@ -413,11 +414,39 @@ internal object LocalProxyEngine {
         }
     }
 
+    private fun readClientHandshake(client: Socket): ByteArray {
+        val result = ByteArray(HANDSHAKE_SIZE)
+        val input = client.getInputStream()
+        var offset = 0
+        val startedAt = System.currentTimeMillis()
+        while (offset < HANDSHAKE_SIZE) {
+            try {
+                val count = input.read(result, offset, HANDSHAKE_SIZE - offset)
+                if (count < 0) {
+                    log("Handshake EOF · received " + offset + "/64 bytes before client closed")
+                    throw SocketException("Client disconnected during MTProto handshake (" + offset + "/64 bytes)")
+                }
+                offset += count
+                if (offset == HANDSHAKE_SIZE) {
+                    log("Handshake received · 64/64 bytes in " +
+                        (System.currentTimeMillis() - startedAt) + "ms")
+                } else if (count > 0) {
+                    log("Handshake progress · " + offset + "/64 bytes")
+                }
+            } catch (error: SocketTimeoutException) {
+                log("Handshake timeout · received " + offset + "/64 bytes in 10000ms")
+                throw error
+            }
+        }
+        return result
+    }
+
     private fun handleClient(client: Socket, secret: ByteArray) {
         var upstream: Upstream? = null
         try {
             client.soTimeout = 10000
-            val header = readExact(client.getInputStream(), HANDSHAKE_SIZE)
+            log("Handshake started · waiting for 64 bytes · " + (client.remoteSocketAddress?.toString() ?: "unknown client"))
+            val header = readClientHandshake(client)
             if (!running.get()) return
             val handshake = decodeHandshake(header, secret) ?: run {
                 log("Rejected client: invalid MTProto handshake or secret")
