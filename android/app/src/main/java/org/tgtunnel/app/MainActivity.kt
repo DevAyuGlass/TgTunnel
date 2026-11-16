@@ -94,6 +94,10 @@ private const val KEY_LOG_FILE_TREE_URI = "log_file_tree_uri"
 private const val DEFAULT_DC_IP = "2:149.154.167.220,4:149.154.167.220"
 
 private val logIds = AtomicLong(0)
+private val logSessionId = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date()) +
+    "-${java.util.UUID.randomUUID().toString().take(8)}"
+@Volatile private var activeLogFileUri: String? = null
+@Volatile private var activeLogFolderUri: String? = null
 private val logWriter = Executors.newSingleThreadExecutor { runnable ->
     Thread(runnable, "tgtunnel-log-writer").apply { isDaemon = true }
 }
@@ -1016,11 +1020,8 @@ private fun appendPersistentLog(context: Context, treeUriText: String, entry: Lo
             val resolver = context.contentResolver
             val preferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             if (preferences.getString(KEY_LOG_FOLDER_URI, "") != treeUriText) return@execute
-            val day = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-            var fileUriText = preferences.getString(KEY_LOG_FILE_URI, null)
-            val savedDay = preferences.getString(KEY_LOG_FILE_DAY, null)
-            val savedTreeUri = preferences.getString(KEY_LOG_FILE_TREE_URI, null)
-            if (fileUriText.isNullOrBlank() || savedDay != day || savedTreeUri != treeUriText) {
+            var fileUriText = activeLogFileUri
+            if (fileUriText.isNullOrBlank() || activeLogFolderUri != treeUriText) {
                 val treeUri = Uri.parse(treeUriText)
                 val treeDocumentId = DocumentsContract.getTreeDocumentId(treeUri)
                 val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, treeDocumentId)
@@ -1028,14 +1029,11 @@ private fun appendPersistentLog(context: Context, treeUriText: String, entry: Lo
                     resolver,
                     parentUri,
                     "text/plain",
-                    "TGTunnel-$day.log"
-                ) ?: throw IllegalStateException("Не удалось создать файл журнала в выбранной папке")
+                    "TGTunnel-$logSessionId.log"
+                ) ?: throw IllegalStateException("Не удалось создать новый файл журнала в выбранной папке")
                 fileUriText = created.toString()
-                preferences.edit()
-                    .putString(KEY_LOG_FILE_URI, fileUriText)
-                    .putString(KEY_LOG_FILE_DAY, day)
-                    .putString(KEY_LOG_FILE_TREE_URI, treeUriText)
-                    .apply()
+                activeLogFileUri = fileUriText
+                activeLogFolderUri = treeUriText
             }
             val fileUri = Uri.parse(fileUriText)
             val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
