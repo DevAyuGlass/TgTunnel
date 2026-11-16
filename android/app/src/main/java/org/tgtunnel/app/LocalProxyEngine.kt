@@ -9,6 +9,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.net.URLEncoder
 import java.net.HttpURLConnection
@@ -64,6 +65,7 @@ internal object LocalProxyEngine {
         4 to "149.154.167.220"
     )
     @Volatile private var frontingFirst: Boolean = false
+    @Volatile private var tlsClientHelloSplit: Boolean = false
     @Volatile private var cfProxyDomains: List<String> = emptyList()
     @Volatile private var cfProxyRefreshThread: Thread? = null
     private val activeCfProxyDomains = ConcurrentHashMap<Int, String>()
@@ -310,7 +312,7 @@ internal object LocalProxyEngine {
 
     fun isRunning(): Boolean = running.get()
 
-    fun start(port: Int, secretHex: String, workerDomain: String, cfProxyEnabled: Boolean, dcIpList: String, onLog: (String) -> Unit): String {
+    fun start(port: Int, secretHex: String, workerDomain: String, cfProxyEnabled: Boolean, dcIpList: String, tlsClientHelloSplit: Boolean, onLog: (String) -> Unit): String {
         if (port !in 1..65535) return "ERR:Port must be between 1 and 65535"
         val secret = parseSecret(secretHex) ?: return "ERR:Secret must contain exactly 32 hexadecimal characters"
         val configuredWorkers = parseWorkerDomains(workerDomain)
@@ -332,6 +334,7 @@ internal object LocalProxyEngine {
                 cloudflareProxyEnabled = cfProxyEnabled
                 dcRedirects = configuredDcRedirects
                 frontingFirst = false
+                this.tlsClientHelloSplit = tlsClientHelloSplit
                 cfProxyDomains = defaultCfProxyDomains
                 // Keep CF Proxy health learned from previous start/stop cycles.
                 tcpFailures.clear()
@@ -417,12 +420,16 @@ internal object LocalProxyEngine {
         var upstream: Upstream? = null
         try {
             client.soTimeout = 10000
-            val header = readExact(client.getInputStream(), HANDSHAKE_SIZE)
+            log("Handshake started · waiting for ${HANDSHAKE_SIZE} bytes · ${client.remoteSocketAddress}")
+            val header = readClientHandshake(client)
             if (!running.get()) return
             val handshake = decodeHandshake(header, secret) ?: run {
-                log("Rejected client: invalid MTProto handshake or secret")
+                log("Handshake validation failed · 64 bytes received, invalid MTProto signature/secret · ${client.remoteSocketAddress}")
                 return
             }
+            log("Handshake valid · DC${handshake.dcId}" +
+                (if (handshake.media) " media" else "") +
+                " · transport=" + transportName(handshake.transportTag))
             client.soTimeout = 0
             val relayInit = generateRelayInit(handshake)
             val crypto = buildCryptoContext(handshake, secret, relayInit)
@@ -1058,8 +1065,13 @@ internal object LocalProxyEngine {
                 if (!running.get()) throw SocketException("Proxy stopped during TCP connect")
                 // Keep the proven TLS transport enabled by default.
                 // ClientHello fragmentation remains experimental until device-side validation.
+                val tlsTransport: Socket = if (tlsClientHelloSplit) {
+                    TlsClientHelloFragmentingSocket(raw) {
+                        log("Telegram DPI: TLS ClientHello split across two records")
+                    }
+                } else raw
                 ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory)
-                    .createSocket(raw, tlsSni, 443, true) as SSLSocket
+                    .createSocket(tlsTransport, tlsSni, 443, true) as SSLSocket
                 if (!registerUpstreamSocket(ssl)) throw SocketException("Proxy stopped before TLS handshake")
                 // Register the TLS wrapper before dropping the raw socket so stop()
                 // can close either representation without an untracked interval.
@@ -1508,6 +1520,33 @@ internal object LocalProxyEngine {
         } catch (_: Exception) {
             null
         }
+    }
+
+    private fun readClientHandshake(client: Socket): ByteArray {
+        val result = ByteArray(HANDSHAKE_SIZE)
+        val input = client.getInputStream()
+        var offset = 0
+        val startedAt = System.currentTimeMillis()
+        while (offset < HANDSHAKE_SIZE) {
+            try {
+                val count = input.read(result, offset, HANDSHAKE_SIZE - offset)
+                if (count < 0) {
+                    log("Handshake EOF · received ${offset}/${HANDSHAKE_SIZE} bytes before client closed")
+                    throw SocketException("Client disconnected during MTProto handshake (${offset}/${HANDSHAKE_SIZE} bytes)")
+                }
+                offset += count
+                if (offset == HANDSHAKE_SIZE) {
+                    log("Handshake received · 64/64 bytes in " +
+                        (System.currentTimeMillis() - startedAt) + "ms")
+                } else {
+                    log("Handshake progress · ${offset}/${HANDSHAKE_SIZE} bytes")
+                }
+            } catch (error: SocketTimeoutException) {
+                log("Handshake timeout · received ${offset}/${HANDSHAKE_SIZE} bytes in 10000ms")
+                throw error
+            }
+        }
+        return result
     }
 
     private fun readExact(input: InputStream, size: Int): ByteArray {
