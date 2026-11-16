@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
@@ -96,7 +97,7 @@ private val logWriter = Executors.newSingleThreadExecutor { runnable ->
     Thread(runnable, "tgtunnel-log-writer").apply { isDaemon = true }
 }
 
-private enum class Screen { HOME, SETTINGS }
+private enum class Screen { HOME, SETTINGS, LOGS }
 private enum class ConnectionState { DISCONNECTED, CONNECTED, ERROR }
 
 private data class AppSettings(
@@ -177,7 +178,7 @@ private fun TgTunnelApp() {
 
     fun addLog(message: String) {
         val entry = newLog(message)
-        logs = (listOf(entry) + logs).take(50)
+        logs = (logs + entry).takeLast(1000)
         // File logging is deliberately opt-in: no selected folder means no persistent log writes.
         if (settings.logFolderUri.isNotBlank()) {
             appendPersistentLog(context.applicationContext, settings.logFolderUri, entry)
@@ -230,6 +231,7 @@ private fun TgTunnelApp() {
                     logs = logs,
                     busy = connectionBusy,
                     onSettings = { screen = Screen.SETTINGS },
+                    onOpenLogs = { screen = Screen.LOGS },
                     onConnect = {
                         val port = settings.port.toIntOrNull()
                         if (port == null || port !in 1..65535) {
@@ -278,6 +280,10 @@ private fun TgTunnelApp() {
                         addLog("Файловое логирование отключено")
                     }
                 )
+                Screen.LOGS -> LogViewerScreen(
+                    logs = logs,
+                    onBack = { screen = Screen.HOME }
+                )
             }
         }
     }
@@ -290,6 +296,7 @@ private fun HomeScreen(
     logs: List<LogEntry>,
     busy: Boolean,
     onSettings: () -> Unit,
+    onOpenLogs: () -> Unit,
     onConnect: () -> Unit,
     onStop: () -> Unit
 ) {
@@ -330,7 +337,7 @@ private fun HomeScreen(
         item(key = "engine-title") { SectionTitle("ДВИЖОК") }
         item(key = "engine") { EngineCard() }
         item(key = "logs-title") { SectionTitle("ЖУРНАЛ СОБЫТИЙ") }
-        item(key = "logs") { LogsCard(logs) }
+        item(key = "logs") { LogsCard(logs, onOpenLogs) }
         item(key = "footer") { Footer(onSettings = onSettings) }
         }
     }
@@ -563,13 +570,13 @@ private fun EngineRow(title: String, value: String, valueColor: Color = TextPrim
 }
 
 @Composable
-private fun LogsCard(logs: List<LogEntry>) {
+private fun LogsCard(logs: List<LogEntry>, onOpenLogs: () -> Unit) {
     val clipboard = LocalClipboardManager.current
     val logText = buildString {
         appendLine("TGTunnel — журнал событий")
-        appendLine("Записей: ${logs.size}")
+        appendLine("Записей в памяти: ${logs.size}")
         appendLine()
-        append(logs.asReversed().joinToString("\n") { "[${it.time}] ${it.message}" })
+        append(logs.joinToString("\n") { "[${it.time}] ${it.message}" })
     }
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -578,20 +585,198 @@ private fun LogsCard(logs: List<LogEntry>) {
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
     ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(11.dp)) {
-            logs.take(6).forEach { entry ->
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text("ПОСЛЕДНИЕ СОБЫТИЯ", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                Text("${logs.size} / 1000", color = TextSecondary, fontSize = 10.sp)
+            }
+            logs.takeLast(6).asReversed().forEach { entry ->
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.Top) {
                     Text(entry.time, color = ConnectBlue, fontSize = 10.sp)
-                    Text(entry.message, color = TextPrimary, fontSize = 12.sp)
+                    Text(entry.message, color = logColor(entry.message), fontSize = 12.sp)
                 }
             }
-            TextButton(
-                onClick = { clipboard.setText(AnnotatedString(logText)) },
-                modifier = Modifier.fillMaxWidth()
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text("КОПИРОВАТЬ ЛОГ", color = ConnectBlue, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                TextButton(onClick = onOpenLogs) {
+                    Text("ОТКРЫТЬ ЖУРНАЛ  →", color = ConnectBlue, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                }
+                TextButton(onClick = { clipboard.setText(AnnotatedString(logText)) }) {
+                    Text("КОПИРОВАТЬ", color = ConnectBlue, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                }
             }
         }
     }
+}
+
+@Composable
+private fun LogViewerScreen(logs: List<LogEntry>, onBack: () -> Unit) {
+    val clipboard = LocalClipboardManager.current
+    val listState = rememberLazyListState()
+    var search by remember { mutableStateOf("") }
+    var selectedLevel by remember { mutableStateOf("ВСЕ") }
+    var followLatest by remember { mutableStateOf(true) }
+
+    val visibleLogs = remember(logs, search, selectedLevel) {
+        logs.filter { entry ->
+            val levelMatches = selectedLevel == "ВСЕ" || logLevel(entry.message) == selectedLevel
+            levelMatches && (search.isBlank() ||
+                entry.message.contains(search, ignoreCase = true) ||
+                entry.time.contains(search, ignoreCase = true))
+        }
+    }
+
+    LaunchedEffect(listState, visibleLogs.size) {
+        kotlinx.coroutines.flow.snapshotFlow {
+            val layout = listState.layoutInfo
+            val lastVisible = layout.visibleItemsInfo.lastOrNull()?.index
+            Triple(listState.isScrollInProgress, lastVisible, layout.totalItemsCount)
+        }.collect { (scrolling, lastVisible, total) ->
+            if (scrolling && lastVisible != null && lastVisible < total - 1) {
+                followLatest = false
+            } else if (lastVisible != null && total > 0 && lastVisible >= total - 1) {
+                followLatest = true
+            }
+        }
+    }
+
+    LaunchedEffect(visibleLogs.size, followLatest) {
+        if (followLatest && visibleLogs.isNotEmpty()) {
+            listState.animateScrollToItem(visibleLogs.lastIndex)
+        }
+    }
+
+    val copiedText = remember(visibleLogs) {
+        buildString {
+            appendLine("TGTunnel — журнал событий")
+            appendLine("Записей: ${visibleLogs.size}")
+            appendLine()
+            append(visibleLogs.joinToString("\n") { "[${it.time}] ${it.message}" })
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().statusBarsPadding().background(Panel)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            TextButton(onClick = onBack) { Text("← НАЗАД", color = ConnectBlue, fontSize = 12.sp) }
+            Column(horizontalAlignment = Alignment.End) {
+                Text("Журнал событий", color = TextPrimary, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text("LIVE · ${visibleLogs.size} записей", color = ConnectedGreen, fontSize = 10.sp)
+            }
+        }
+
+        OutlinedTextField(
+            value = search,
+            onValueChange = { search = it },
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+            singleLine = true,
+            label = { Text("Поиск по журналу") },
+            placeholder = { Text("DNS, WebSocket, ошибка...") }
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            listOf("ВСЕ", "INFO", "WARN", "ERROR").forEach { level ->
+                TextButton(onClick = { selectedLevel = level }) {
+                    Text(
+                        level,
+                        color = if (selectedLevel == level) ConnectBlue else TextSecondary,
+                        fontSize = 10.sp,
+                        fontWeight = if (selectedLevel == level) FontWeight.Bold else FontWeight.Normal
+                    )
+                }
+            }
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                if (followLatest) "Автопрокрутка включена" else "Просмотр истории · автопрокрутка выключена",
+                color = TextSecondary,
+                fontSize = 10.sp
+            )
+            TextButton(onClick = { clipboard.setText(AnnotatedString(copiedText)) }) {
+                Text("КОПИРОВАТЬ", color = ConnectBlue, fontSize = 10.sp)
+            }
+        }
+
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            items(visibleLogs, key = { it.id }) { entry ->
+                Row(
+                    modifier = Modifier.fillMaxWidth()
+                        .background(Panel, RoundedCornerShape(10.dp))
+                        .padding(horizontal = 10.dp, vertical = 9.dp),
+                    horizontalArrangement = Arrangement.spacedBy(9.dp),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    Text(entry.time, color = TextSecondary, fontSize = 10.sp)
+                    Text(
+                        logLevel(entry.message),
+                        color = logColor(entry.message),
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        entry.message,
+                        color = TextPrimary,
+                        fontSize = 11.sp,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+
+        if (!followLatest) {
+            Button(
+                onClick = {
+                    followLatest = true
+                    if (visibleLogs.isNotEmpty()) {
+                        // The state update also triggers the automatic scroll effect.
+                    }
+                },
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = ConnectBlue, contentColor = Background)
+            ) {
+                Text("↓  К ПОСЛЕДНИМ СОБЫТИЯМ", fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+private fun logLevel(message: String): String {
+    val value = message.lowercase(Locale.ROOT)
+    return when {
+        listOf("error", "failed", "exception", "unable", "не удалось", "ошибка", "abort").any(value::contains) -> "ERROR"
+        listOf("warning", "inconclusive", "retry", "предупреждение").any(value::contains) -> "WARN"
+        else -> "INFO"
+    }
+}
+
+private fun logColor(message: String): Color = when (logLevel(message)) {
+    "ERROR" -> ErrorRed
+    "WARN" -> AccentPurple
+    else -> TextPrimary
 }
 
 @Composable
