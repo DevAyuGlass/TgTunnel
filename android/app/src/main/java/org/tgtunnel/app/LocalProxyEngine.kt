@@ -16,7 +16,13 @@ import java.net.URL
 import java.security.MessageDigest
 import java.security.SecureRandom
 import android.util.Base64
+import java.util.concurrent.Callable
+import java.util.concurrent.CompletionService
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -40,6 +46,9 @@ internal object LocalProxyEngine {
     private const val MAX_CONNECTIONS = 32
     private const val WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
     private val random = SecureRandom()
+    private val cfConnectExecutor = Executors.newFixedThreadPool(8) { runnable ->
+        Thread(runnable, "tgtunnel-cf-connect").apply { isDaemon = true }
+    }
     private val activeClients = ConcurrentHashMap.newKeySet<Socket>()
     // Includes sockets during TCP connect, TLS handshake, and HTTP Upgrade.
     private val activeUpstreams = ConcurrentHashMap.newKeySet<Socket>()
@@ -225,6 +234,14 @@ internal object LocalProxyEngine {
                             if (opcode == 0x1) continue
                             if (firstReceivedAtMs == 0L) {
                                 firstReceivedAtMs = System.currentTimeMillis()
+                                if (cfProxyDomain != null && cfProxyDc != null) {
+                                    val previous = activeCfProxyDomains.put(cfProxyDc, cfProxyDomain)
+                                    cfProxyFailures.remove(cfProxyDomain)
+                                    cfProxyRetryAfter.remove(cfProxyDomain)
+                                    if (previous != cfProxyDomain) {
+                                        log("Cloudflare Proxy route promoted for DC" + cfProxyDc + ": " + cfProxyDomain)
+                                    }
+                                }
                                 if (firstResponseLogged.compareAndSet(false, true)) {
                                     val responseDelay = if (firstSentAtMs > 0L) firstReceivedAtMs - firstSentAtMs else -1L
                                     log("WebSocket first binary response: " +
@@ -680,6 +697,122 @@ internal object LocalProxyEngine {
         }
     }
 
+    private data class CfProxyAttemptResult(
+        val domain: String,
+        val upstream: WebSocketUpstream? = null,
+        val error: Exception? = null,
+        val superseded: Boolean = false
+    )
+
+    /**
+     * Race two Cloudflare routes with a short stagger. The first successful
+     * WebSocket wins; a slower successful attempt closes itself instead of
+     * leaking a spare upstream. Remaining pool entries are tried sequentially.
+     */
+    private fun connectCloudflareCandidates(
+        candidates: List<String>,
+        dcForDomain: Int,
+        telegramDc: Int
+    ): WebSocketUpstream? {
+        if (candidates.isEmpty() || !running.get()) return null
+
+        val racingCandidates = candidates.take(2)
+        val completion: CompletionService<CfProxyAttemptResult> =
+            ExecutorCompletionService(cfConnectExecutor)
+        val winner = AtomicReference<WebSocketUpstream?>(null)
+        val raceFinished = AtomicBoolean(false)
+        val futures = mutableListOf<Future<CfProxyAttemptResult>>()
+        var submitted = 0
+        var completed = 0
+
+        fun submit(domain: String) {
+            futures += completion.submit(Callable {
+                try {
+                    val host = "kws" + dcForDomain + "." + domain
+                    val upstream = connectWebSocket(
+                        host,
+                        cfProxyDomain = domain,
+                        cfProxyDc = dcForDomain
+                    )
+                    if (!running.get() || raceFinished.get() || !winner.compareAndSet(null, upstream)) {
+                        unregisterUpstreamSocket(extractSocket(upstream))
+                        CfProxyAttemptResult(domain, superseded = true)
+                    } else {
+                        CfProxyAttemptResult(domain, upstream = upstream)
+                    }
+                } catch (error: Exception) {
+                    CfProxyAttemptResult(domain, error = error)
+                }
+            })
+            submitted++
+        }
+
+        submit(racingCandidates.first())
+        val secondLaunchAt = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(180)
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
+
+        try {
+            while (completed < submitted || submitted < racingCandidates.size) {
+                if (!running.get()) break
+
+                val now = System.nanoTime()
+                if (submitted < racingCandidates.size && now >= secondLaunchAt) {
+                    submit(racingCandidates[submitted])
+                }
+
+                val remaining = deadline - now
+                if (remaining <= 0L) break
+                val waitNanos = minOf(remaining, TimeUnit.MILLISECONDS.toNanos(50))
+                val future = completion.poll(waitNanos, TimeUnit.NANOSECONDS)
+
+                if (future == null) {
+                    if (completed == submitted && submitted < racingCandidates.size) {
+                        submit(racingCandidates[submitted])
+                    }
+                    continue
+                }
+
+                completed++
+                val result = runCatching { future.get() }.getOrNull() ?: continue
+                if (result.upstream != null) {
+                    raceFinished.set(true)
+                    activeCfProxyDomains[dcForDomain] = result.domain
+                    cfProxyFailures.remove(result.domain)
+                    cfProxyRetryAfter.remove(result.domain)
+                    futures.forEach { if (!it.isDone) it.cancel(true) }
+                    log("WebSocket established to DC" + telegramDc +
+                        " through Cloudflare Proxy (" + result.domain + "); fast route selected")
+                    return result.upstream
+                }
+                if (!result.superseded && result.error != null && running.get()) {
+                    recordCfProxyConnectFailure(result.domain, result.error)
+                }
+                if (completed == submitted && submitted < racingCandidates.size) {
+                    submit(racingCandidates[submitted])
+                }
+            }
+        } finally {
+            raceFinished.set(true)
+            futures.forEach { if (!it.isDone) it.cancel(true) }
+        }
+
+        val selected = winner.get()
+        if (selected != null && running.get()) {
+            activeCfProxyDomains[dcForDomain] = selected.cfProxyDomain ?: return null
+            return selected
+        }
+        return null
+    }
+
+    private fun recordCfProxyConnectFailure(domain: String, error: Exception) {
+        val failures = (cfProxyFailures[domain] ?: 0) + 1
+        cfProxyFailures[domain] = failures
+        val backoffSeconds = minOf(300L, 5L shl minOf(failures - 1, 5))
+        cfProxyRetryAfter[domain] = System.currentTimeMillis() + backoffSeconds * 1000L
+        log("Cloudflare Proxy " + domain + " failed (retry in " + backoffSeconds + "s): " +
+            (error.message ?: error.javaClass.simpleName))
+    }
+
     private fun connectUpstream(handshake: Handshake): Upstream? {
         if (!running.get()) return null
         val dcForDomain = if (handshake.dcId == 203) 2 else handshake.dcId
@@ -706,7 +839,9 @@ internal object LocalProxyEngine {
             if (candidates.isEmpty()) {
                 log("Cloudflare Proxy pool is cooling down; retrying with the full pool")
             }
-            for (baseDomain in candidates.ifEmpty { cfProxyDomains.shuffled() }) {
+            val orderedCandidates = candidates.ifEmpty { cfProxyDomains.shuffled() }
+            connectCloudflareCandidates(orderedCandidates, dcForDomain, handshake.dcId)?.let { return it }
+            for (baseDomain in orderedCandidates.drop(2)) {
                 if (!running.get()) return null
                 val host = "kws" + dcForDomain + "." + baseDomain
                 try {
@@ -715,17 +850,13 @@ internal object LocalProxyEngine {
                         unregisterUpstreamSocket(extractSocket(upstream))
                         return null
                     }
+                    activeCfProxyDomains[dcForDomain] = baseDomain
                     log("WebSocket established to DC" + handshake.dcId +
                         " through Cloudflare Proxy (" + baseDomain + "); waiting for tunnel health")
                     return upstream
                 } catch (error: Exception) {
                     if (!running.get()) return null
-                    val failures = (cfProxyFailures[baseDomain] ?: 0) + 1
-                    cfProxyFailures[baseDomain] = failures
-                    val backoffSeconds = minOf(300L, 5L shl minOf(failures - 1, 5))
-                    cfProxyRetryAfter[baseDomain] = System.currentTimeMillis() + backoffSeconds * 1000L
-                    log("Cloudflare Proxy " + baseDomain + " failed (retry in " + backoffSeconds + "s): " +
-                        (error.message ?: error.javaClass.simpleName))
+                    recordCfProxyConnectFailure(baseDomain, error)
                 }
             }
         }
