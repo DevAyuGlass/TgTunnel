@@ -158,18 +158,10 @@ private fun TgTunnelApp() {
         )
     }
 
-    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-        if (uri != null) {
-            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            runCatching { context.contentResolver.takePersistableUriPermission(uri, flags) }
-            updateSettings(settings.copy(logFolderUri = uri.toString()))
-            addLog("Папка для файлового логирования выбрана")
-        }
-    }
-
     fun updateSettings(next: AppSettings) {
+        val folderChanged = next.logFolderUri != settings.logFolderUri
         settings = next
-        preferences.edit()
+        val editor = preferences.edit()
             .putInt(KEY_PORT, next.port.toIntOrNull() ?: 1443)
             .putString(KEY_SECRET, next.secret)
             .putBoolean(KEY_AUTOSTART, next.autostart)
@@ -178,7 +170,8 @@ private fun TgTunnelApp() {
             .putBoolean(KEY_CF_PROXY, next.cfProxyFallback)
             .putString(KEY_DC_IP, next.dcIp)
             .putString(KEY_LOG_FOLDER_URI, next.logFolderUri)
-            .apply()
+        if (folderChanged) editor.remove(KEY_LOG_FILE_URI).remove(KEY_LOG_FILE_DAY)
+        editor.apply()
     }
 
     fun addLog(message: String) {
@@ -187,6 +180,15 @@ private fun TgTunnelApp() {
         // File logging is deliberately opt-in: no selected folder means no persistent log writes.
         if (settings.logFolderUri.isNotBlank()) {
             appendPersistentLog(context.applicationContext, settings.logFolderUri, entry)
+        }
+    }
+
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            runCatching { context.contentResolver.takePersistableUriPermission(uri, flags) }
+            updateSettings(settings.copy(logFolderUri = uri.toString()))
+            addLog("Папка для файлового логирования выбрана")
         }
     }
 
