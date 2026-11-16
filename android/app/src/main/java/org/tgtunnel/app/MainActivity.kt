@@ -3,11 +3,14 @@ package org.tgtunnel.app
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -58,6 +61,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.Executors
 import java.security.SecureRandom
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -81,9 +85,15 @@ private const val KEY_SECRET = "mtproto_secret"
 private const val KEY_CF_WORKER = "cloudflare_worker_domain"
 private const val KEY_CF_PROXY = "cloudflare_proxy_fallback"
 private const val KEY_DC_IP = "dc_ip_redirects"
+private const val KEY_LOG_FOLDER_URI = "log_folder_uri"
+private const val KEY_LOG_FILE_URI = "log_file_uri"
+private const val KEY_LOG_FILE_DAY = "log_file_day"
 private const val DEFAULT_DC_IP = "2:149.154.167.220,4:149.154.167.220"
 
 private val logIds = AtomicLong(0)
+private val logWriter = Executors.newSingleThreadExecutor { runnable ->
+    Thread(runnable, "tgtunnel-log-writer").apply { isDaemon = true }
+}
 
 private enum class Screen { HOME, SETTINGS }
 private enum class ConnectionState { DISCONNECTED, CONNECTED, ERROR }
@@ -95,7 +105,8 @@ private data class AppSettings(
     val verboseLogs: Boolean = false,
     val workerDomain: String = "",
     val cfProxyFallback: Boolean = true,
-    val dcIp: String = DEFAULT_DC_IP
+    val dcIp: String = DEFAULT_DC_IP,
+    val logFolderUri: String = ""
 )
 
 private data class LogEntry(
@@ -129,7 +140,8 @@ private fun TgTunnelApp() {
                 verboseLogs = preferences.getBoolean(KEY_VERBOSE, false),
                 workerDomain = preferences.getString(KEY_CF_WORKER, "") ?: "",
                 cfProxyFallback = preferences.getBoolean(KEY_CF_PROXY, true),
-                dcIp = preferences.getString(KEY_DC_IP, DEFAULT_DC_IP) ?: DEFAULT_DC_IP
+                dcIp = preferences.getString(KEY_DC_IP, DEFAULT_DC_IP) ?: DEFAULT_DC_IP,
+                logFolderUri = preferences.getString(KEY_LOG_FOLDER_URI, "") ?: ""
             )
         )
     }
@@ -146,6 +158,15 @@ private fun TgTunnelApp() {
         )
     }
 
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            runCatching { context.contentResolver.takePersistableUriPermission(uri, flags) }
+            updateSettings(settings.copy(logFolderUri = uri.toString()))
+            addLog("Папка для файлового логирования выбрана")
+        }
+    }
+
     fun updateSettings(next: AppSettings) {
         settings = next
         preferences.edit()
@@ -156,11 +177,17 @@ private fun TgTunnelApp() {
             .putString(KEY_CF_WORKER, next.workerDomain)
             .putBoolean(KEY_CF_PROXY, next.cfProxyFallback)
             .putString(KEY_DC_IP, next.dcIp)
+            .putString(KEY_LOG_FOLDER_URI, next.logFolderUri)
             .apply()
     }
 
     fun addLog(message: String) {
-        logs = (listOf(newLog(message)) + logs).take(50)
+        val entry = newLog(message)
+        logs = (listOf(entry) + logs).take(50)
+        // File logging is deliberately opt-in: no selected folder means no persistent log writes.
+        if (settings.logFolderUri.isNotBlank()) {
+            appendPersistentLog(context.applicationContext, settings.logFolderUri, entry)
+        }
     }
 
     BackHandler(enabled = screen != Screen.HOME) { screen = Screen.HOME }
@@ -241,7 +268,12 @@ private fun TgTunnelApp() {
                     settings = settings,
                     engineInfo = NativeBridge.info(),
                     onBack = { screen = Screen.HOME },
-                    onSettingsChanged = ::updateSettings
+                    onSettingsChanged = ::updateSettings,
+                    onChooseLogFolder = { folderPicker.launch(null) },
+                    onClearLogFolder = {
+                        updateSettings(settings.copy(logFolderUri = ""))
+                        addLog("Файловое логирование отключено")
+                    }
                 )
             }
         }
@@ -564,7 +596,9 @@ private fun SettingsScreen(
     settings: AppSettings,
     engineInfo: String,
     onBack: () -> Unit,
-    onSettingsChanged: (AppSettings) -> Unit
+    onSettingsChanged: (AppSettings) -> Unit,
+    onChooseLogFolder: () -> Unit,
+    onClearLogFolder: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     Column(modifier = Modifier.fillMaxSize()) {
@@ -651,6 +685,29 @@ private fun SettingsScreen(
                     subtitle = "Больше диагностической информации",
                     checked = settings.verboseLogs,
                     onCheckedChange = { onSettingsChanged(settings.copy(verboseLogs = it)) }
+                )
+            }
+        }
+        item {
+            SettingsPanel {
+                Text("ФАЙЛОВОЕ ЛОГИРОВАНИЕ", color = TextSecondary, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                Text(
+                    if (settings.logFolderUri.isBlank()) "Папка не выбрана · запись файлов отключена" else "Папка выбрана · события будут записываться в TGTunnel-YYYY-MM-DD.log",
+                    color = if (settings.logFolderUri.isBlank()) TextSecondary else ConnectedGreen,
+                    fontSize = 12.sp
+                )
+                Button(onClick = onChooseLogFolder, modifier = Modifier.fillMaxWidth()) {
+                    Text("ВЫБРАТЬ ПАПКУ ДЛЯ ЛОГИРОВАНИЯ")
+                }
+                if (settings.logFolderUri.isNotBlank()) {
+                    TextButton(onClick = onClearLogFolder, modifier = Modifier.fillMaxWidth()) {
+                        Text("ОТКЛЮЧИТЬ ФАЙЛОВОЕ ЛОГИРОВАНИЕ", color = ErrorRed)
+                    }
+                }
+                Text(
+                    "TGTunnel создаёт отдельный текстовый файл на каждый день. Если папка не выбрана, файлы не создаются; короткий журнал внутри приложения продолжает работать.",
+                    color = TextSecondary,
+                    fontSize = 11.sp
                 )
             }
         }
@@ -755,6 +812,43 @@ private fun Footer(onSettings: () -> Unit) {
     ) {
         Text("TGTunnel · 0.3.0 · Android only", color = TextSecondary, fontSize = 11.sp)
         TextButton(onClick = onSettings) { Text("НАСТРОЙКИ", color = ConnectBlue, fontSize = 10.sp) }
+    }
+}
+
+private fun appendPersistentLog(context: Context, treeUriText: String, entry: LogEntry) {
+    logWriter.execute {
+        try {
+            val resolver = context.contentResolver
+            val preferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val day = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+            var fileUriText = preferences.getString(KEY_LOG_FILE_URI, null)
+            val savedDay = preferences.getString(KEY_LOG_FILE_DAY, null)
+            if (fileUriText.isNullOrBlank() || savedDay != day) {
+                val treeUri = Uri.parse(treeUriText)
+                val treeDocumentId = DocumentsContract.getTreeDocumentId(treeUri)
+                val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, treeDocumentId)
+                val created = DocumentsContract.createDocument(
+                    resolver,
+                    parentUri,
+                    "text/plain",
+                    "TGTunnel-$day.log"
+                ) ?: throw IllegalStateException("Не удалось создать файл журнала в выбранной папке")
+                fileUriText = created.toString()
+                preferences.edit()
+                    .putString(KEY_LOG_FILE_URI, fileUriText)
+                    .putString(KEY_LOG_FILE_DAY, day)
+                    .apply()
+            }
+            val fileUri = Uri.parse(fileUriText)
+            val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
+            val line = "[$timestamp] ${entry.message}\n"
+            resolver.openOutputStream(fileUri, "wa")?.use { output ->
+                output.write(line.toByteArray(Charsets.UTF_8))
+                output.flush()
+            } ?: throw IllegalStateException("Провайдер хранилища не открыл файл для добавления")
+        } catch (error: Exception) {
+            android.util.Log.e("TGTunnel", "Persistent log write failed", error)
+        }
     }
 }
 
