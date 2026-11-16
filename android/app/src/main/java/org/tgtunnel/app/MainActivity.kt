@@ -50,6 +50,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -622,6 +623,7 @@ private fun LogViewerScreen(logs: List<LogEntry>, onBack: () -> Unit) {
     var search by remember { mutableStateOf("") }
     var selectedLevel by remember { mutableStateOf("ВСЕ") }
     var followLatest by remember { mutableStateOf(true) }
+    var programmaticScroll by remember { mutableStateOf(false) }
 
     val visibleLogs = remember(logs, search, selectedLevel) {
         logs.filter { entry ->
@@ -632,15 +634,15 @@ private fun LogViewerScreen(logs: List<LogEntry>, onBack: () -> Unit) {
         }
     }
 
-    LaunchedEffect(listState, visibleLogs.size) {
-        kotlinx.coroutines.flow.snapshotFlow {
+    LaunchedEffect(listState) {
+        snapshotFlow {
             val layout = listState.layoutInfo
             val lastVisible = layout.visibleItemsInfo.lastOrNull()?.index
             Triple(listState.isScrollInProgress, lastVisible, layout.totalItemsCount)
         }.collect { (scrolling, lastVisible, total) ->
-            if (scrolling && lastVisible != null && lastVisible < total - 1) {
+            if (scrolling && !programmaticScroll && lastVisible != null && lastVisible < total - 1) {
                 followLatest = false
-            } else if (lastVisible != null && total > 0 && lastVisible >= total - 1) {
+            } else if (!scrolling && lastVisible != null && total > 0 && lastVisible >= total - 1) {
                 followLatest = true
             }
         }
@@ -648,7 +650,12 @@ private fun LogViewerScreen(logs: List<LogEntry>, onBack: () -> Unit) {
 
     LaunchedEffect(visibleLogs.size, followLatest) {
         if (followLatest && visibleLogs.isNotEmpty()) {
-            listState.animateScrollToItem(visibleLogs.lastIndex)
+            programmaticScroll = true
+            try {
+                listState.animateScrollToItem(visibleLogs.lastIndex)
+            } finally {
+                programmaticScroll = false
+            }
         }
     }
 
@@ -767,8 +774,8 @@ private fun LogViewerScreen(logs: List<LogEntry>, onBack: () -> Unit) {
 private fun logLevel(message: String): String {
     val value = message.lowercase(Locale.ROOT)
     return when {
-        listOf("error", "failed", "exception", "unable", "не удалось", "ошибка", "abort").any(value::contains) -> "ERROR"
-        listOf("warning", "inconclusive", "retry", "предупреждение").any(value::contains) -> "WARN"
+        listOf("error", "failed", "exception", "unable", "не удалось", "ошибка", "abort").any { value.contains(it) } -> "ERROR"
+        listOf("warning", "inconclusive", "retry", "предупреждение").any { value.contains(it) } -> "WARN"
         else -> "INFO"
     }
 }
